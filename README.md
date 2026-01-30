@@ -15,5 +15,5 @@ from unpack_DSLcorr_v3_optimized import run_ParceSpecPacket
 result = run_ParceSpecPacket('data.dat', save=True)
 ```
 
-详细文档见 [README_unpack_DSLcorr_v3.md](./docs/README_HongMeng_raw_data_Parser.md)
+详细文档见 [README_unpack_DSLcorr_v3.md](docs/README_HongMeng_raw_data_Parser.md)
 
