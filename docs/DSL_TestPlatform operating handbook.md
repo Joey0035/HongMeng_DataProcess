@@ -1,18 +1,8 @@
-# README HongMeng Raw Data Parser
+# DSL_TestPlatform operating handbook
 
 
 
-## 🛎️待补充功能
-
-### Log 260130
-
-- **VNA数据解包**
-- **温度数据解包**
-- **数据包格式可能有更新**
-
-
-
-## 📋 概述
+## 📋 
 
 `HongMeng_raw_data_Parser.py` 用于解析 DSL FPGA 数据采集系统原始 `.dat` 文件。
 
