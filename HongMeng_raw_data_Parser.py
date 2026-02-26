@@ -2,16 +2,9 @@
 """
 Author: JoeyXu
 Date: 2026-01-29
-Description: DSL原始数据解析 - 深度优化版本 v3
-优化特性：
-1. 流式分块读取，支持GB级大文件（自动选择整读/分块模式）
-2. 批量numpy操作，减少Python循环开销
-3. 预分配内存，降低内存峰值30-50%
-4. 结构化日志系统，实时进度追踪
-5. 自动内存管理和垃圾回收
-6. 完整错误捕获和跳过机制
+Description: HongMeng原始数据解析
 """
-
+# %%
 from pathlib import Path
 import numpy as np
 from dataclasses import dataclass
@@ -30,56 +23,104 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # 常数定义
-SYNC_WORD = b'\xEB\x90'
-PACKET_HEADER_SIZE = 2 + 2 + 2 + 3  # 9 bytes
-PACKET_TIME_SIZE = 8
-PACKET_CHECKSUM_SIZE = 2
-SCI_DATA_SIZE = 2304
+SYNC_WORD = b'\xEB\x90'  # 同步码
+PACKET_HEADER_SIZE = 2 + 2 + 2 + 3   # 9 bytes：sync + pkt_id + seq_ctrl + data_len字段
+PACKET_TIME_SIZE = 8                   # 时间码（副导头）
+PACKET_SRC_NUM_SIZE = 1               # 被测源序列号
+PACKET_VALID_LEN_SIZE = 3             # 有效数据域长度字段
+PACKET_CHECKSUM_SIZE = 2              # 校验和
+# 包数据域 = 时间(8) + 被测源序列号(1) + 有效数据域长度(3) + 有效数据(N)
+PACKET_DATA_DOMAIN_OVERHEAD = PACKET_TIME_SIZE + PACKET_SRC_NUM_SIZE + PACKET_VALID_LEN_SIZE  # 12 bytes
+
+# 应用过程标识符（11 bits）→ 数据类型
+APP_ID_SPEC = 0x000   # 相关器数据，N=2304
+APP_ID_VNA  = 0x7FF   # VNA数据，    N=2404
+APP_ID_TEMP = 0x7C0   # 温度数据，   N=75
+APP_ID_MAP  = {
+    APP_ID_SPEC: 'SPEC',
+    APP_ID_VNA:  'VNA',
+    APP_ID_TEMP: 'TEMP',
+}
+
+# 各类型有效数据字节数（N）
+SCI_DATA_SIZES = {
+    'SPEC': 2304,
+    'VNA':  2404,
+    'TEMP': 75,
+}
+
 PACKETS_PER_SPEC = 64
 CHANNELS_PER_SPEC = 4
 VALUES_PER_CHANNEL = 4096
 BYTES_PER_VALUE = 9
 
+# 数据包类型字面量（供类型标注使用）
+PktDataType = str  # 'SPEC' | 'VNA' | 'TEMP' | 'UNKNOWN'
+
+
 @dataclass
 class SpecPacket:
-    """数据包结构体"""
     sync: int
     version: int
     pkt_type: int
     sec_hdr_flag: int
-    app_id: int
+    app_id: int           # 应用过程标识符（11 bits），区分 SPEC/VNA/TEMP
     group_flag: int
     seq_count: int
-    data_len: int
+    data_len: int         # 包数据域字节数（含时间、src_num、valid_data_len、有效数据）
     seconds: int
     microseconds: int
-    sci_data: bytes
+    src_num: int          # 被测源序列号（8 bits）
+    valid_data_len: int   # 有效数据字节数 N
+    sci_data: bytes       # 有效数据（SPEC/VNA/TEMP 原始字节）
     checksum: int
+    pkt_data_type: PktDataType  # 'SPEC' | 'VNA' | 'TEMP' | 'UNKNOWN'
 
     __slots__ = ('sync', 'version', 'pkt_type', 'sec_hdr_flag', 'app_id',
                  'group_flag', 'seq_count', 'data_len', 'seconds',
-                 'microseconds', 'sci_data', 'checksum')
+                 'microseconds', 'src_num', 'valid_data_len', 'sci_data',
+                 'checksum', 'pkt_data_type')
+
+    def __repr__(self) -> str:
+        """十六进制格式显示关键字段"""
+        return (f"SpecPacket(sync={self.sync:04x}, version={self.version:#b}"
+                f"pkt_type={self.pkt_type:#b}, sec_hdr_flag={self.sec_hdr_flag:#b}, "
+                f"app_id={self.app_id:04x}, group_flag={self.group_flag:#b}, "
+                f"seq_count={self.seq_count}, data_len={self.data_len}, "
+                f"time={self.seconds}.{self.microseconds:06d}, "
+                f"src_num={self.src_num}, valid_data_len={self.valid_data_len}, "
+                f"checksum={self.checksum:04x}), type={self.pkt_data_type}")
 
 
 class PacketParser:
-    """数据包解析器 - 优化版本"""
 
     def __init__(self, log_errors: bool = True):
         self.log_errors = log_errors
         self.error_count = 0
         self.packet_count = 0
+        self.type_counts: Dict[str, int] = {}  # 各类型包计数
 
     def calc_checksum(self, data: bytes) -> int:
-        """计算校验和"""
         return sum(data) & 0xFFFF
 
     def parse_packet(self, buf: bytes | memoryview) -> Optional[SpecPacket]:
-        """解析单个数据包 - 高效版本"""
-        if len(buf) < PACKET_HEADER_SIZE + PACKET_TIME_SIZE + SCI_DATA_SIZE + PACKET_CHECKSUM_SIZE:
+        """解析单个数据包（新格式：支持 SPEC/VNA/TEMP 三种类型）
+
+        包结构：
+          sync(2) | pkt_id(2) | seq_ctrl(2) | data_len_field(3)  ← PACKET_HEADER_SIZE=9
+          seconds(4) | microseconds(4)                            ← 副导头时间码
+          src_num(1) | valid_data_len_field(3) | sci_data(N)      ← 有效数据域
+          checksum(2)
+        其中 data_len_field 存储的值 = 包数据域字节数 - 1
+             包数据域 = 8 + 1 + 3 + N = 12 + N
+        """
+        # 最小包长 = header(9) + data_domain_overhead(12) + 75字节数据 + checksum(2)
+        if len(buf) < PACKET_HEADER_SIZE + PACKET_DATA_DOMAIN_OVERHEAD + 75 + PACKET_CHECKSUM_SIZE:
             return None
 
         try:
             offset = 0
+
             # 1. 同步码
             sync = struct.unpack_from(">H", buf, offset)[0]
             if sync != 0xEB90:
@@ -89,34 +130,48 @@ class PacketParser:
             # 2. 包标识
             pkt_id = struct.unpack_from(">H", buf, offset)[0]
             offset += 2
-            version = (pkt_id >> 13) & 0b111
-            pkt_type = (pkt_id >> 12) & 0b1
+            version     = (pkt_id >> 13) & 0b111
+            pkt_type    = (pkt_id >> 12) & 0b1
             sec_hdr_flag = (pkt_id >> 11) & 0b1
-            app_id = pkt_id & 0x7FF
+            app_id      = pkt_id & 0x7FF  # 应用过程标识符（11 bits）
 
             # 3. 包序控制
             seq_ctrl = struct.unpack_from(">H", buf, offset)[0]
             offset += 2
             group_flag = (seq_ctrl >> 14) & 0b11
-            seq_count = seq_ctrl & 0x3FFF
+            seq_count  = seq_ctrl & 0x3FFF
 
-            # 4. 数据域长度
+            # 4. 包数据域长度（24 bit，值 = 包数据域字节数 - 1）
+            #    包数据域 = 时间(8) + src_num(1) + valid_data_len字段(3) + 有效数据(N)
             data_len_raw = int.from_bytes(buf[offset:offset + 3], "big")
-            data_len = data_len_raw + 1
+            data_len = data_len_raw + 1  # 包数据域实际字节数
             offset += 3
 
-            # 5. 时间码
+            # 5. 副导头：时间码
             seconds, microseconds = struct.unpack_from(">II", buf, offset)
             offset += 8
 
-            # 6. 有效数据
-            sci_data = bytes(buf[offset:offset + data_len])
-            offset += data_len
+            # 6. 有效数据域：被测源序列号（8 bits）
+            src_num = buf[offset]
+            offset += 1
 
-            # 7. 校验和
+            # 7. 有效数据域：有效数据域长度（24 bits，值 = N - 1）
+            valid_data_len_raw = int.from_bytes(buf[offset:offset + 3], "big")
+            valid_data_len = valid_data_len_raw + 1  # 有效数据实际字节数 N
+            offset += 3
+
+            # 8. 有效数据域：科学/VNA/温度数据（N 字节）
+            sci_data = bytes(buf[offset:offset + valid_data_len])
+            offset += valid_data_len
+
+            # 9. 校验和
             checksum = struct.unpack_from(">H", buf, offset)[0]
 
+            # 识别包数据类型
+            pkt_data_type = APP_ID_MAP.get(app_id, 'UNKNOWN')
+            self.type_counts[pkt_data_type] = self.type_counts.get(pkt_data_type, 0) + 1
             self.packet_count += 1
+
             return SpecPacket(
                 sync=sync,
                 version=version,
@@ -128,15 +183,33 @@ class PacketParser:
                 data_len=data_len,
                 seconds=seconds,
                 microseconds=microseconds,
+                src_num=src_num,
+                valid_data_len=valid_data_len,
                 sci_data=sci_data,
-                checksum=checksum
+                checksum=checksum,
+                pkt_data_type=pkt_data_type,
             )
         except Exception as e:
             if self.log_errors:
                 self.error_count += 1
-                if self.error_count <= 10:  # 只记录前10个错误
+                if self.error_count <= 10:
                     logger.debug(f"Packet parse error: {e}")
             return None
+
+    def separate_packets_by_type(
+        self, packets: list
+    ) -> Dict[str, list]:
+        """
+        Returns
+        -------
+        dict with keys 'SPEC', 'VNA', 'TEMP', 'UNKNOWN' (只含非空类型)
+        """
+        separated: Dict[str, list] = {}
+        for pkt in packets:
+            separated.setdefault(pkt.pkt_data_type, []).append(pkt)
+        for dtype, lst in separated.items():
+            logger.info(f"  {dtype:7s}: {len(lst):6d} packets")
+        return separated
 
     def parse_packets_streaming(
         self,
@@ -219,10 +292,12 @@ class PacketParser:
                     break
 
                 data_len_raw = int.from_bytes(mv[offset:offset + 3], "big")
-                data_len = data_len_raw + 1
+                data_len = data_len_raw + 1  # 包数据域字节数（含时间+src_num+valid_len+有效数据）
                 offset += 3
 
-                total_len = PACKET_HEADER_SIZE + PACKET_TIME_SIZE + data_len + PACKET_CHECKSUM_SIZE
+                # total_len = 主导头(9) + 包数据域(data_len) + 校验和(2)
+                # data_len 已包含时间码，无需再加 PACKET_TIME_SIZE
+                total_len = PACKET_HEADER_SIZE + data_len + PACKET_CHECKSUM_SIZE
                 if start + total_len > buf_len:
                     offset = start
                     break
@@ -241,11 +316,12 @@ class PacketParser:
 
     def parse_packets_all_in_memory(self, buf: bytes) -> list:
         """整读模式（小文件）"""
-        return self._extract_packets_from_buffer(buf)
+        packets, _ = self._extract_packets_from_buffer(buf)
+        return packets
 
-
+# %%
 class SciDataProcessor:
-    """科学数据处理器 - 优化版本"""
+    """科学数据处理器 """
 
     @staticmethod
     def bytes_to_int64_vec(data_views: list) -> np.ndarray:
@@ -308,56 +384,52 @@ class SciDataProcessor:
 
 
 class MetadataExtractor:
-    """元数据提取器 - 高效版本"""
 
     @staticmethod
     def validate_consistency(packets: list) -> Tuple[int, int, int, int]:
-        """验证packet元数据一致性"""
+        """验证packet元数据一致性（首尾检查）"""
         if not packets:
             raise ValueError("No packets provided")
 
         first = packets[0]
         last = packets[-1]
 
-        # 只检查首尾，假设中间一致（合理假设）
         if first.version != last.version:
             raise ValueError(f"Version mismatch: {first.version} != {last.version}")
-
         if first.pkt_type != last.pkt_type:
             raise ValueError(f"Packet type mismatch: {first.pkt_type} != {last.pkt_type}")
-
         if first.sec_hdr_flag != last.sec_hdr_flag:
-            raise ValueError(f"Secondary header flag mismatch")
-
+            raise ValueError("Secondary header flag mismatch")
         if first.app_id != last.app_id:
-            raise ValueError(f"App ID mismatch: {first.app_id} != {last.app_id}")
+            raise ValueError(f"App ID mismatch: {first.app_id:#05x} != {last.app_id:#05x}")
 
         return first.version, first.pkt_type, first.sec_hdr_flag, first.app_id
 
     @staticmethod
     def extract_arrays(packets: list) -> Dict[str, np.ndarray]:
-        """高效提取元数据数组"""
+        """高效提取元数据数组（含 src_num）"""
         n = len(packets)
 
-        # 预分配数组
-        group_flag = np.empty(n, dtype=np.uint8)
-        seq_count = np.empty(n, dtype=np.uint16)
-        time_array = np.empty(n, dtype=np.float64)
+        group_flag  = np.empty(n, dtype=np.uint8)
+        seq_count   = np.empty(n, dtype=np.uint16)
+        time_array  = np.empty(n, dtype=np.float64)
+        src_num_arr = np.empty(n, dtype=np.uint8)
 
-        # 单次遍历填充所有数组
         for i, pkt in enumerate(packets):
-            group_flag[i] = pkt.group_flag
-            seq_count[i] = pkt.seq_count
-            time_array[i] = pkt.seconds + pkt.microseconds * 1e-6
+            group_flag[i]  = pkt.group_flag
+            seq_count[i]   = pkt.seq_count
+            time_array[i]  = pkt.seconds + pkt.microseconds * 1e-6
+            src_num_arr[i] = pkt.src_num
 
         return {
             'group_flag': group_flag,
-            'seq_count': seq_count,
-            'time': time_array
+            'seq_count':  seq_count,
+            'time':       time_array,
+            'src_num':    src_num_arr,
         }
 
 
-class DSLFileProcessor:
+class HongMengFileProcessor:
     """主处理类"""
 
     def __init__(self, verbose: bool = True):
@@ -374,7 +446,7 @@ class DSLFileProcessor:
         chunk_size: int = 64 * 1024 * 1024,
         stream_threshold: int = 512 * 1024 * 1024,
     ) -> Dict:
-        """处理DSL文件"""
+
         file_path = Path(file_path)
         logger.info(f"Starting DSL file processing: {file_path.name}")
 
@@ -392,41 +464,64 @@ class DSLFileProcessor:
         if not packets:
             raise ValueError("No valid packets found")
 
-        logger.info(f"Parsed {len(packets)} packets")
+        logger.info(f"Parsed {len(packets)} packets total")
 
-        # 2. 对齐数据包
-        aligned_packets = self._align_packets(packets, skip_pkt)
+        # 2. 按类型分离数据包
+        logger.info("Separating packets by type:")
+        separated = self.parser.separate_packets_by_type(packets)
 
-        # 3. 验证元数据
-        version, pkt_type, sec_hdr_flag, app_id = \
-            self.metadata_extractor.validate_consistency(aligned_packets)
-        logger.info(f"Metadata: v{version}, type={pkt_type}, app_id={app_id}")
+        result: Dict = {}
 
-        # 4. 提取元数据
-        metadata = self.metadata_extractor.extract_arrays(aligned_packets)
+        # ---------- 2a. 相关器数据（SPEC）----------
+        spec_pkts = separated.get('SPEC', [])
+        if spec_pkts:
+            aligned = self._align_packets(spec_pkts, skip_pkt)
+            if aligned:
+                version, pkt_type_val, sec_hdr_flag, app_id = \
+                    self.metadata_extractor.validate_consistency(aligned)
+                logger.info(f"SPEC meta: v{version} app_id={app_id:#05x}")
+                meta = self.metadata_extractor.extract_arrays(aligned)
+                logger.info("Processing SPEC data...")
+                spec_data = self.sci_processor.process_all_specs(aligned)
+                logger.info(f"SPEC data shape: {spec_data.shape}")
+                result.update({
+                    'version': version, 'pkt_type': pkt_type_val,
+                    'sec_hdr_flag': sec_hdr_flag, 'app_id': app_id,
+                    'spec_data':   spec_data,
+                    'spec_time':   meta['time'],
+                    'spec_seq':    meta['seq_count'],
+                    'spec_group':  meta['group_flag'],
+                    'spec_src':    meta['src_num'],
+                })
 
-        # 5. 处理科学数据
-        logger.info("Processing scientific data...")
-        sci_data = self.sci_processor.process_all_specs(aligned_packets)
-        logger.info(f"Sci data shape: {sci_data.shape}")
+        # ---------- 2b. VNA 数据 ----------
+        vna_pkts = separated.get('VNA', [])
+        if vna_pkts:
+            meta = self.metadata_extractor.extract_arrays(vna_pkts)
+            logger.info(f"VNA: {len(vna_pkts)} packets")
+            result.update({
+                'vna_raw':  [pkt.sci_data for pkt in vna_pkts],
+                'vna_time': meta['time'],
+                'vna_seq':  meta['seq_count'],
+                'vna_src':  meta['src_num'],
+            })
 
-        # 6. 验证
-        n_specs = sci_data.shape[0]
-        expected_time_count = n_specs * PACKETS_PER_SPEC
-        if metadata['time'].shape[0] != expected_time_count:
-            raise ValueError(f"Shape mismatch: {metadata['time'].shape[0]} != {expected_time_count}")
+        # ---------- 2c. 温度数据（TEMP）----------
+        temp_pkts = separated.get('TEMP', [])
+        if temp_pkts:
+            meta = self.metadata_extractor.extract_arrays(temp_pkts)
+            logger.info(f"TEMP: {len(temp_pkts)} packets")
+            result.update({
+                'temp_raw':  [pkt.sci_data for pkt in temp_pkts],
+                'temp_time': meta['time'],
+                'temp_seq':  meta['seq_count'],
+                'temp_src':  meta['src_num'],
+            })
 
-        # 7. 保存
-        result = {
-            'version': version,
-            'pkt_type': pkt_type,
-            'sec_hdr_flag': sec_hdr_flag,
-            'app_id': app_id,
-            'group_flag': metadata['group_flag'],
-            'seq_count': metadata['seq_count'],
-            'time': metadata['time'],
-            'sci_data': sci_data,
-        }
+        # ---------- 2d. 未知类型 ----------
+        unk_pkts = separated.get('UNKNOWN', [])
+        if unk_pkts:
+            logger.warning(f"UNKNOWN type: {len(unk_pkts)} packets ignored")
 
         if save:
             self._save_result(file_path, result)
@@ -445,11 +540,17 @@ class DSLFileProcessor:
 
     @staticmethod
     def _save_result(file_path: Path, result: Dict):
-        """保存结果"""
+        """保存结果（list 类型字段转 object array 后保存）"""
         output_path = file_path.parent / f"{file_path.stem}_Parced_v3.npz"
         logger.info(f"Saving to {output_path.name}")
-        np.savez_compressed(output_path, **result)
-        logger.info(f"Saved successfully")
+        save_data = {}
+        for k, v in result.items():
+            if isinstance(v, list):
+                save_data[k] = np.array(v, dtype=object)
+            elif isinstance(v, (np.ndarray, int, float, str)):
+                save_data[k] = v
+        np.savez_compressed(output_path, **save_data)
+        logger.info("Saved successfully")
 
 
 # 向后兼容接口
@@ -460,7 +561,7 @@ def run_ParceSpecPacket(
     chunk_size: int = 64 * 1024 * 1024,
     stream_threshold: int = 512 * 1024 * 1024,
 ) -> Dict:
-    processor = DSLFileProcessor(verbose=True)
+    processor = HongMengFileProcessor(verbose=True)
     return processor.process_file(
         file_path=file_dir,
         skip_pkt=skip_pkt,
@@ -472,7 +573,7 @@ def run_ParceSpecPacket(
 
 if __name__ == '__main__':
     if len(sys.argv) < 2:
-        print("Usage: python unpack_DSLcorr_v3_optimized.py <file_path> [skip_pkt] [save]")
+        print("Usage: python HongMeng_raw_data_Parser.py <file_path> [skip_pkt] [save]")
         sys.exit(1)
 
     file_path = sys.argv[1]
@@ -481,4 +582,6 @@ if __name__ == '__main__':
 
     result = run_ParceSpecPacket(file_path, skip_pkt=skip_pkt, save=save)
     print(f"Result keys: {result.keys()}")
-    print(f"Sci data shape: {result['sci_data'].shape}")
+    print(f"SPEC data shape: {result['spec_data'].shape}")
+
+# %%
