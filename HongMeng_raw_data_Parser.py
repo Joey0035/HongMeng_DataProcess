@@ -29,8 +29,9 @@ PACKET_TIME_SIZE = 8                   # 时间码（副导头）
 PACKET_SRC_NUM_SIZE = 1               # 被测源序列号
 PACKET_VALID_LEN_SIZE = 3             # 有效数据域长度字段
 PACKET_CHECKSUM_SIZE = 2              # 校验和
-# 包数据域 = 时间(8) + 被测源序列号(1) + 有效数据域长度(3) + 有效数据(N)
-PACKET_DATA_DOMAIN_OVERHEAD = PACKET_TIME_SIZE + PACKET_SRC_NUM_SIZE + PACKET_VALID_LEN_SIZE  # 12 bytes
+# 包数据域 = 时间(8) + 被测源序列号(1) + 有效数据域长度(3) + 有效数据(N) + 校验和(2)
+# 注意：校验和属于包数据域的一部分，data_len 字段值已包含校验和
+PACKET_DATA_DOMAIN_OVERHEAD = PACKET_TIME_SIZE + PACKET_SRC_NUM_SIZE + PACKET_VALID_LEN_SIZE + PACKET_CHECKSUM_SIZE  # 14 bytes
 
 # 应用过程标识符（11 bits）→ 数据类型
 APP_ID_SPEC = 0x000   # 相关器数据，N=2304
@@ -67,7 +68,7 @@ class SpecPacket:
     app_id: int           # 应用过程标识符（11 bits），区分 SPEC/VNA/TEMP
     group_flag: int
     seq_count: int
-    data_len: int         # 包数据域字节数（含时间、src_num、valid_data_len、有效数据）
+    data_len: int         # 包数据域字节数（含时间、src_num、valid_data_len、有效数据、校验和）
     seconds: int
     microseconds: int
     src_num: int          # 被测源序列号（8 bits）
@@ -110,12 +111,15 @@ class PacketParser:
           sync(2) | pkt_id(2) | seq_ctrl(2) | data_len_field(3)  ← PACKET_HEADER_SIZE=9
           seconds(4) | microseconds(4)                            ← 副导头时间码
           src_num(1) | valid_data_len_field(3) | sci_data(N)      ← 有效数据域
-          checksum(2)
+          checksum(2)                                              ← 校验和（属于包数据域）
         其中 data_len_field 存储的值 = 包数据域字节数 - 1
-             包数据域 = 8 + 1 + 3 + N = 12 + N
+             包数据域 = 8 + 1 + 3 + N + 2 = 14 + N
+        总包长 = PACKET_HEADER_SIZE(9) + 包数据域(14 + N) = 23 + N
         """
-        # 最小包长 = header(9) + data_domain_overhead(12) + 75字节数据 + checksum(2)
-        if len(buf) < PACKET_HEADER_SIZE + PACKET_DATA_DOMAIN_OVERHEAD + 75 + PACKET_CHECKSUM_SIZE:
+        # 最小包长 = header(9) + 最小数据域(time+src_num+valid_len+min_data+checksum)
+        # 最小数据域 = overhead(14) + 1字节数据 = 15，但实际不用卡这么紧
+        # 只需确保能读完 header + 副导头 + src_num + valid_data_len 字段即可
+        if len(buf) < PACKET_HEADER_SIZE + PACKET_DATA_DOMAIN_OVERHEAD:
             return None
 
         try:
@@ -142,7 +146,7 @@ class PacketParser:
             seq_count  = seq_ctrl & 0x3FFF
 
             # 4. 包数据域长度（24 bit，值 = 包数据域字节数 - 1）
-            #    包数据域 = 时间(8) + src_num(1) + valid_data_len字段(3) + 有效数据(N)
+            #    包数据域 = 时间(8) + src_num(1) + valid_data_len字段(3) + 科学数据(N) + 校验和(2) = 14 + N
             data_len_raw = int.from_bytes(buf[offset:offset + 3], "big")
             data_len = data_len_raw + 1  # 包数据域实际字节数
             offset += 3
@@ -156,16 +160,33 @@ class PacketParser:
             offset += 1
 
             # 7. 有效数据域：有效数据域长度（24 bits，值 = N - 1）
+            #    注意：valid_data_len 是逻辑有效字节数，可能小于物理分配空间
+            #    物理分配空间 = data_len - time(8) - src_num(1) - valid_len_field(3) - checksum(2)
             valid_data_len_raw = int.from_bytes(buf[offset:offset + 3], "big")
             valid_data_len = valid_data_len_raw + 1  # 有效数据实际字节数 N
             offset += 3
 
-            # 8. 有效数据域：科学/VNA/温度数据（N 字节）
-            sci_data = bytes(buf[offset:offset + valid_data_len])
-            offset += valid_data_len
+            # 8. 有效数据域：科学/VNA/温度数据
+            #    sci_data_space = 物理分配空间（含填充 0x7E）
+            #    valid_data_len = 有效数据长度（不含填充）
+            sci_data_space = data_len - PACKET_DATA_DOMAIN_OVERHEAD  # data_len - 14
+            sci_data = bytes(buf[offset:offset + sci_data_space])
+            offset += sci_data_space
 
-            # 9. 校验和
+            # 9. 校验和（覆盖副导头到有效数据末尾，含填充）
             checksum = struct.unpack_from(">H", buf, offset)[0]
+
+            # 校验和验证：副导头(时间码) + 有效数据域(src_num + valid_data_len字段 + 全部科学数据含填充)
+            checksum_start = PACKET_HEADER_SIZE  # offset 9
+            checksum_end = offset                 # 9 + data_len - 2
+            calc_sum = self.calc_checksum(bytes(buf[checksum_start:checksum_end]))
+            if calc_sum != checksum:
+                if self.log_errors:
+                    self.error_count += 1
+                    if self.error_count <= 10:
+                        logger.debug(f"Checksum mismatch: calc=0x{calc_sum:04X}, "
+                                    f"expected=0x{checksum:04X}")
+                return None
 
             # 识别包数据类型
             pkt_data_type = APP_ID_MAP.get(app_id, 'UNKNOWN')
@@ -292,12 +313,12 @@ class PacketParser:
                     break
 
                 data_len_raw = int.from_bytes(mv[offset:offset + 3], "big")
-                data_len = data_len_raw + 1  # 包数据域字节数（含时间+src_num+valid_len+有效数据）
+                data_len = data_len_raw + 1  # 包数据域字节数（含时间+src_num+valid_len+科学数据+校验和）
                 offset += 3
 
-                # total_len = 主导头(9) + 包数据域(data_len) + 校验和(2)
-                # data_len 已包含时间码，无需再加 PACKET_TIME_SIZE
-                total_len = PACKET_HEADER_SIZE + data_len + PACKET_CHECKSUM_SIZE
+                # total_len = 主导头(9) + 包数据域(data_len)
+                # data_len 已包含时间码、有效数据及校验和，无需再加 PACKET_CHECKSUM_SIZE
+                total_len = PACKET_HEADER_SIZE + data_len
                 if start + total_len > buf_len:
                     offset = start
                     break
