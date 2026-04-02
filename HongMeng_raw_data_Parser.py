@@ -512,7 +512,7 @@ class HongMengFileProcessor:
 
         result['spec'] = {
             'data':     np.ndarray (n_fft, 4, 4096),  # 解码后的科学数据
-            'raw':      list[bytes],                   # 每个FFT块64包拼接的原始字节
+            'raw':      np.ndarray (n_pkt,) object,    # 每包原始科学数据 bytes
             'time':     np.ndarray (n_pkt,),           # 每包时间戳 float64
             'seq':      np.ndarray (n_pkt,),           # 包序列计数 uint16
             'src':      np.ndarray (n_pkt,),           # 被测源序列号 uint8
@@ -570,12 +570,10 @@ class HongMengFileProcessor:
                 spec_data = self.sci_processor.process_all_specs(aligned)
                 logger.info(f"SPEC data shape: {spec_data.shape}")
 
-                # 提取每个 FFT 块的原始包数据（64 包拼接）
-                n_fft = len(aligned) // PACKETS_PER_SPEC
-                spec_raw = []
-                for i in range(n_fft):
-                    block = aligned[i * PACKETS_PER_SPEC:(i + 1) * PACKETS_PER_SPEC]
-                    spec_raw.append(b''.join(pkt.sci_data for pkt in block))
+                # per-packet 原始科学数据
+                spec_raw = np.empty(len(aligned), dtype=object)
+                for i, pkt in enumerate(aligned):
+                    spec_raw[i] = pkt.sci_data
 
                 result['spec'] = {
                     'data':     spec_data,
@@ -591,8 +589,11 @@ class HongMengFileProcessor:
         if vna_pkts:
             primary, metadata = self.metadata_extractor.extract_arrays(vna_pkts)
             logger.info(f"VNA: {len(vna_pkts)} packets")
+            vna_raw = np.empty(len(vna_pkts), dtype=object)
+            for i, pkt in enumerate(vna_pkts):
+                vna_raw[i] = pkt.sci_data
             result['vna'] = {
-                'raw':      [pkt.sci_data for pkt in vna_pkts],
+                'raw':      vna_raw,
                 'time':     primary['time'],
                 'seq':      primary['seq'],
                 'src':      primary['src'],
@@ -604,8 +605,11 @@ class HongMengFileProcessor:
         if temp_pkts:
             primary, metadata = self.metadata_extractor.extract_arrays(temp_pkts)
             logger.info(f"TEMP: {len(temp_pkts)} packets")
+            temp_raw = np.empty(len(temp_pkts), dtype=object)
+            for i, pkt in enumerate(temp_pkts):
+                temp_raw[i] = pkt.sci_data
             result['temp'] = {
-                'raw':      [pkt.sci_data for pkt in temp_pkts],
+                'raw':      temp_raw,
                 'time':     primary['time'],
                 'seq':      primary['seq'],
                 'src':      primary['src'],
@@ -634,7 +638,7 @@ class HongMengFileProcessor:
 
     @staticmethod
     def _save_result(file_path: Path, result: Dict):
-        """保存结果（嵌套 dict 展平为 type_field / type_meta_field 格式后保存）"""
+        """保存结果（展平为 type_field / type_meta_field 格式）"""
         output_path = file_path.parent / f"{file_path.stem}_Parced_v3.npz"
         logger.info(f"Saving to {output_path.name}")
         save_data = {}
@@ -644,11 +648,8 @@ class HongMengFileProcessor:
             for field, value in sub_dict.items():
                 if field == 'metadata' and isinstance(value, dict):
                     for mf, mv in value.items():
-                        flat_key = f"{type_key}_meta_{mf}"
                         if isinstance(mv, (np.ndarray, int, float, str)):
-                            save_data[flat_key] = mv
-                elif isinstance(value, list):
-                    save_data[f"{type_key}_{field}"] = np.array(value, dtype=object)
+                            save_data[f"{type_key}_meta_{mf}"] = mv
                 elif isinstance(value, (np.ndarray, int, float, str)):
                     save_data[f"{type_key}_{field}"] = value
         np.savez_compressed(output_path, **save_data)
