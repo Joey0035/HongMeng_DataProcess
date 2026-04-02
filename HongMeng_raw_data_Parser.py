@@ -407,8 +407,8 @@ class SciDataProcessor:
 class MetadataExtractor:
 
     @staticmethod
-    def validate_consistency(packets: list) -> Tuple[int, int, int, int]:
-        """验证packet元数据一致性（首尾检查）"""
+    def validate_consistency(packets: list) -> Tuple[int, int, int]:
+        """验证packet元数据一致性（首尾检查，不含 app_id，因其可能变化）"""
         if not packets:
             raise ValueError("No packets provided")
 
@@ -421,28 +421,29 @@ class MetadataExtractor:
             raise ValueError(f"Packet type mismatch: {first.pkt_type} != {last.pkt_type}")
         if first.sec_hdr_flag != last.sec_hdr_flag:
             raise ValueError("Secondary header flag mismatch")
-        if first.app_id != last.app_id:
-            raise ValueError(f"App ID mismatch: {first.app_id:#05x} != {last.app_id:#05x}")
 
-        return first.version, first.pkt_type, first.sec_hdr_flag, first.app_id
+        return first.version, first.pkt_type, first.sec_hdr_flag
 
     @staticmethod
     def extract_arrays(packets: list) -> Dict[str, np.ndarray]:
-        """高效提取元数据数组（含 src_num）"""
+        """高效提取元数据数组（含 app_id, src_num）"""
         n = len(packets)
 
+        app_id_arr  = np.empty(n, dtype=np.uint16)
         group_flag  = np.empty(n, dtype=np.uint8)
         seq_count   = np.empty(n, dtype=np.uint16)
         time_array  = np.empty(n, dtype=np.float64)
         src_num_arr = np.empty(n, dtype=np.uint8)
 
         for i, pkt in enumerate(packets):
+            app_id_arr[i]  = pkt.app_id
             group_flag[i]  = pkt.group_flag
             seq_count[i]   = pkt.seq_count
             time_array[i]  = pkt.seconds + pkt.microseconds * 1e-6
             src_num_arr[i] = pkt.src_num
 
         return {
+            'app_id':     app_id_arr,
             'group_flag': group_flag,
             'seq_count':  seq_count,
             'time':       time_array,
@@ -467,6 +468,40 @@ class HongMengFileProcessor:
         chunk_size: int = 64 * 1024 * 1024,
         stream_threshold: int = 512 * 1024 * 1024,
     ) -> Dict:
+        """处理原始数据文件
+
+        Returns
+        -------
+        Dict，按数据类型组织：
+        {
+          'spec': {                        # 相关器数据（若存在）
+              'data':      np.ndarray,     # (n_fft, 4, 4096) int64 科学数据
+              'raw':       list[bytes],    # 每个 64-packet 块的原始科学数据拼接 (hex 可查)
+              'time':      np.ndarray,     # 每包时间戳 (float64)
+              'seq':       np.ndarray,     # 包序列计数 (uint16)
+              'group':     np.ndarray,     # 分组标志 (uint8)
+              'src':       np.ndarray,     # 被测源序列号 (uint8)
+              'app_id':    np.ndarray,     # 应用过程标识符 (uint16)
+              'version':   int,
+              'pkt_type':  int,
+              'sec_hdr_flag': int,
+          },
+          'vna': {                         # VNA 数据（若存在）
+              'raw':       list[bytes],    # 每包原始科学数据
+              'time':      np.ndarray,
+              'seq':       np.ndarray,
+              'src':       np.ndarray,
+              'app_id':    np.ndarray,
+          },
+          'temp': {                        # 温度数据（若存在）
+              'raw':       list[bytes],    # 每包原始科学数据
+              'time':      np.ndarray,
+              'seq':       np.ndarray,
+              'src':       np.ndarray,
+              'app_id':    np.ndarray,
+          },
+        }
+        """
 
         file_path = Path(file_path)
         logger.info(f"Starting DSL file processing: {file_path.name}")
@@ -498,46 +533,59 @@ class HongMengFileProcessor:
         if spec_pkts:
             aligned = self._align_packets(spec_pkts, skip_pkt)
             if aligned:
-                version, pkt_type_val, sec_hdr_flag, app_id = \
+                version, pkt_type_val, sec_hdr_flag = \
                     self.metadata_extractor.validate_consistency(aligned)
-                logger.info(f"SPEC meta: v{version} app_id={app_id:#05x}")
+                logger.info(f"SPEC meta: v{version}")
                 meta = self.metadata_extractor.extract_arrays(aligned)
                 logger.info("Processing SPEC data...")
                 spec_data = self.sci_processor.process_all_specs(aligned)
                 logger.info(f"SPEC data shape: {spec_data.shape}")
-                result.update({
-                    'version': version, 'pkt_type': pkt_type_val,
-                    'sec_hdr_flag': sec_hdr_flag, 'app_id': app_id,
-                    'spec_data':   spec_data,
-                    'spec_time':   meta['time'],
-                    'spec_seq':    meta['seq_count'],
-                    'spec_group':  meta['group_flag'],
-                    'spec_src':    meta['src_num'],
-                })
+
+                # 提取每个 FFT 块的原始包数据（64 包拼接）
+                n_fft = len(aligned) // PACKETS_PER_SPEC
+                spec_raw = []
+                for i in range(n_fft):
+                    block = aligned[i * PACKETS_PER_SPEC:(i + 1) * PACKETS_PER_SPEC]
+                    spec_raw.append(b''.join(pkt.sci_data for pkt in block))
+
+                result['spec'] = {
+                    'data':        spec_data,
+                    'raw':         spec_raw,
+                    'time':        meta['time'],
+                    'seq':         meta['seq_count'],
+                    'group':       meta['group_flag'],
+                    'src':         meta['src_num'],
+                    'app_id':      meta['app_id'],
+                    'version':     version,
+                    'pkt_type':    pkt_type_val,
+                    'sec_hdr_flag': sec_hdr_flag,
+                }
 
         # ---------- 2b. VNA 数据 ----------
         vna_pkts = separated.get('VNA', [])
         if vna_pkts:
             meta = self.metadata_extractor.extract_arrays(vna_pkts)
             logger.info(f"VNA: {len(vna_pkts)} packets")
-            result.update({
-                'vna_raw':  [pkt.sci_data for pkt in vna_pkts],
-                'vna_time': meta['time'],
-                'vna_seq':  meta['seq_count'],
-                'vna_src':  meta['src_num'],
-            })
+            result['vna'] = {
+                'raw':    [pkt.sci_data for pkt in vna_pkts],
+                'time':   meta['time'],
+                'seq':    meta['seq_count'],
+                'src':    meta['src_num'],
+                'app_id': meta['app_id'],
+            }
 
         # ---------- 2c. 温度数据（TEMP）----------
         temp_pkts = separated.get('TEMP', [])
         if temp_pkts:
             meta = self.metadata_extractor.extract_arrays(temp_pkts)
             logger.info(f"TEMP: {len(temp_pkts)} packets")
-            result.update({
-                'temp_raw':  [pkt.sci_data for pkt in temp_pkts],
-                'temp_time': meta['time'],
-                'temp_seq':  meta['seq_count'],
-                'temp_src':  meta['src_num'],
-            })
+            result['temp'] = {
+                'raw':    [pkt.sci_data for pkt in temp_pkts],
+                'time':   meta['time'],
+                'seq':    meta['seq_count'],
+                'src':    meta['src_num'],
+                'app_id': meta['app_id'],
+            }
 
         # ---------- 2d. 未知类型 ----------
         unk_pkts = separated.get('UNKNOWN', [])
@@ -561,15 +609,19 @@ class HongMengFileProcessor:
 
     @staticmethod
     def _save_result(file_path: Path, result: Dict):
-        """保存结果（list 类型字段转 object array 后保存）"""
+        """保存结果（嵌套 dict 展平为 type_field 格式后保存）"""
         output_path = file_path.parent / f"{file_path.stem}_Parced_v3.npz"
         logger.info(f"Saving to {output_path.name}")
         save_data = {}
-        for k, v in result.items():
-            if isinstance(v, list):
-                save_data[k] = np.array(v, dtype=object)
-            elif isinstance(v, (np.ndarray, int, float, str)):
-                save_data[k] = v
+        for type_key, sub_dict in result.items():
+            if not isinstance(sub_dict, dict):
+                continue
+            for field, value in sub_dict.items():
+                flat_key = f"{type_key}_{field}"
+                if isinstance(value, list):
+                    save_data[flat_key] = np.array(value, dtype=object)
+                elif isinstance(value, (np.ndarray, int, float, str)):
+                    save_data[flat_key] = value
         np.savez_compressed(output_path, **save_data)
         logger.info("Saved successfully")
 
@@ -602,7 +654,16 @@ if __name__ == '__main__':
     save = sys.argv[3].lower() == 'true' if len(sys.argv) > 3 else False
 
     result = run_ParceSpecPacket(file_path, skip_pkt=skip_pkt, save=save)
-    print(f"Result keys: {result.keys()}")
-    print(f"SPEC data shape: {result['spec_data'].shape}")
+    print(f"Result keys: {list(result.keys())}")
+    for type_key in result:
+        sub = result[type_key]
+        print(f"\n[{type_key}]:")
+        for field, value in sub.items():
+            if hasattr(value, 'shape'):
+                print(f"  {field}: shape={value.shape}, dtype={value.dtype}")
+            elif isinstance(value, list):
+                print(f"  {field}: list len={len(value)}")
+            else:
+                print(f"  {field}: {value}")
 
 # %%
