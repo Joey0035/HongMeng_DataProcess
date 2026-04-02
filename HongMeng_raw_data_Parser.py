@@ -425,30 +425,66 @@ class MetadataExtractor:
         return first.version, first.pkt_type, first.sec_hdr_flag
 
     @staticmethod
-    def extract_arrays(packets: list) -> Dict[str, np.ndarray]:
-        """高效提取元数据数组（含 app_id, src_num）"""
+    def extract_arrays(packets: list) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
+        """提取主字段和 per-packet metadata，方便通过 metadata[field][i] 查找第 i 个包
+
+        Returns
+        -------
+        (primary, metadata)
+            primary:  {'time', 'seq', 'src'}         ← 常用主字段
+            metadata: {'app_id', 'version', 'pkt_type', 'sec_hdr_flag',
+                       'group_flag', 'data_len', 'valid_data_len', 'checksum'}
+                       ← per-packet 包头字段，可按索引定位任意包
+        """
         n = len(packets)
 
-        app_id_arr  = np.empty(n, dtype=np.uint16)
-        group_flag  = np.empty(n, dtype=np.uint8)
-        seq_count   = np.empty(n, dtype=np.uint16)
+        # 主字段
         time_array  = np.empty(n, dtype=np.float64)
+        seq_count   = np.empty(n, dtype=np.uint16)
         src_num_arr = np.empty(n, dtype=np.uint8)
 
-        for i, pkt in enumerate(packets):
-            app_id_arr[i]  = pkt.app_id
-            group_flag[i]  = pkt.group_flag
-            seq_count[i]   = pkt.seq_count
-            time_array[i]  = pkt.seconds + pkt.microseconds * 1e-6
-            src_num_arr[i] = pkt.src_num
+        # metadata — 包头完整字段，per-packet
+        app_id_arr      = np.empty(n, dtype=np.uint16)
+        version_arr     = np.empty(n, dtype=np.uint8)
+        pkt_type_arr    = np.empty(n, dtype=np.uint8)
+        sec_hdr_arr     = np.empty(n, dtype=np.uint8)
+        group_flag_arr  = np.empty(n, dtype=np.uint8)
+        data_len_arr    = np.empty(n, dtype=np.uint32)
+        valid_len_arr   = np.empty(n, dtype=np.uint32)
+        checksum_arr    = np.empty(n, dtype=np.uint16)
 
-        return {
-            'app_id':     app_id_arr,
-            'group_flag': group_flag,
-            'seq_count':  seq_count,
-            'time':       time_array,
-            'src_num':    src_num_arr,
+        for i, pkt in enumerate(packets):
+            time_array[i]     = pkt.seconds + pkt.microseconds * 1e-6
+            seq_count[i]      = pkt.seq_count
+            src_num_arr[i]    = pkt.src_num
+
+            app_id_arr[i]     = pkt.app_id
+            version_arr[i]    = pkt.version
+            pkt_type_arr[i]   = pkt.pkt_type
+            sec_hdr_arr[i]    = pkt.sec_hdr_flag
+            group_flag_arr[i] = pkt.group_flag
+            data_len_arr[i]   = pkt.data_len
+            valid_len_arr[i]  = pkt.valid_data_len
+            checksum_arr[i]   = pkt.checksum
+
+        primary = {
+            'time': time_array,
+            'seq':  seq_count,
+            'src':  src_num_arr,
         }
+
+        metadata = {
+            'app_id':         app_id_arr,
+            'version':        version_arr,
+            'pkt_type':       pkt_type_arr,
+            'sec_hdr_flag':   sec_hdr_arr,
+            'group_flag':     group_flag_arr,
+            'data_len':       data_len_arr,
+            'valid_data_len': valid_len_arr,
+            'checksum':       checksum_arr,
+        }
+
+        return primary, metadata
 
 
 class HongMengFileProcessor:
@@ -472,35 +508,30 @@ class HongMengFileProcessor:
 
         Returns
         -------
-        Dict，按数据类型组织：
-        {
-          'spec': {                        # 相关器数据（若存在）
-              'data':      np.ndarray,     # (n_fft, 4, 4096) int64 科学数据
-              'raw':       list[bytes],    # 每个 64-packet 块的原始科学数据拼接 (hex 可查)
-              'time':      np.ndarray,     # 每包时间戳 (float64)
-              'seq':       np.ndarray,     # 包序列计数 (uint16)
-              'group':     np.ndarray,     # 分组标志 (uint8)
-              'src':       np.ndarray,     # 被测源序列号 (uint8)
-              'app_id':    np.ndarray,     # 应用过程标识符 (uint16)
-              'version':   int,
-              'pkt_type':  int,
-              'sec_hdr_flag': int,
-          },
-          'vna': {                         # VNA 数据（若存在）
-              'raw':       list[bytes],    # 每包原始科学数据
-              'time':      np.ndarray,
-              'seq':       np.ndarray,
-              'src':       np.ndarray,
-              'app_id':    np.ndarray,
-          },
-          'temp': {                        # 温度数据（若存在）
-              'raw':       list[bytes],    # 每包原始科学数据
-              'time':      np.ndarray,
-              'seq':       np.ndarray,
-              'src':       np.ndarray,
-              'app_id':    np.ndarray,
-          },
+        Dict，按数据类型组织，每种类型包含 data/raw/time/seq/src + metadata：
+
+        result['spec'] = {
+            'data':     np.ndarray (n_fft, 4, 4096),  # 解码后的科学数据
+            'raw':      list[bytes],                   # 每个FFT块64包拼接的原始字节
+            'time':     np.ndarray (n_pkt,),           # 每包时间戳 float64
+            'seq':      np.ndarray (n_pkt,),           # 包序列计数 uint16
+            'src':      np.ndarray (n_pkt,),           # 被测源序列号 uint8
+            'metadata': {                              # per-packet 包头字段
+                'app_id':         np.ndarray uint16,   #   应用过程标识符
+                'version':        np.ndarray uint8,    #   版本号
+                'pkt_type':       np.ndarray uint8,    #   包类型
+                'sec_hdr_flag':   np.ndarray uint8,    #   副导头标志
+                'group_flag':     np.ndarray uint8,    #   分组标志
+                'data_len':       np.ndarray uint32,   #   包数据域字节数
+                'valid_data_len': np.ndarray uint32,   #   有效数据字节数
+                'checksum':       np.ndarray uint16,   #   校验和
+            },
         }
+
+        result['vna']  = { 'raw', 'time', 'seq', 'src', 'metadata': {...} }
+        result['temp'] = { 'raw', 'time', 'seq', 'src', 'metadata': {...} }
+
+        通过 metadata[field][i] 可快速定位第 i 个包的任意包头字段。
         """
 
         file_path = Path(file_path)
@@ -533,10 +564,8 @@ class HongMengFileProcessor:
         if spec_pkts:
             aligned = self._align_packets(spec_pkts, skip_pkt)
             if aligned:
-                version, pkt_type_val, sec_hdr_flag = \
-                    self.metadata_extractor.validate_consistency(aligned)
-                logger.info(f"SPEC meta: v{version}")
-                meta = self.metadata_extractor.extract_arrays(aligned)
+                self.metadata_extractor.validate_consistency(aligned)
+                primary, metadata = self.metadata_extractor.extract_arrays(aligned)
                 logger.info("Processing SPEC data...")
                 spec_data = self.sci_processor.process_all_specs(aligned)
                 logger.info(f"SPEC data shape: {spec_data.shape}")
@@ -549,42 +578,38 @@ class HongMengFileProcessor:
                     spec_raw.append(b''.join(pkt.sci_data for pkt in block))
 
                 result['spec'] = {
-                    'data':        spec_data,
-                    'raw':         spec_raw,
-                    'time':        meta['time'],
-                    'seq':         meta['seq_count'],
-                    'group':       meta['group_flag'],
-                    'src':         meta['src_num'],
-                    'app_id':      meta['app_id'],
-                    'version':     version,
-                    'pkt_type':    pkt_type_val,
-                    'sec_hdr_flag': sec_hdr_flag,
+                    'data':     spec_data,
+                    'raw':      spec_raw,
+                    'time':     primary['time'],
+                    'seq':      primary['seq'],
+                    'src':      primary['src'],
+                    'metadata': metadata,
                 }
 
         # ---------- 2b. VNA 数据 ----------
         vna_pkts = separated.get('VNA', [])
         if vna_pkts:
-            meta = self.metadata_extractor.extract_arrays(vna_pkts)
+            primary, metadata = self.metadata_extractor.extract_arrays(vna_pkts)
             logger.info(f"VNA: {len(vna_pkts)} packets")
             result['vna'] = {
-                'raw':    [pkt.sci_data for pkt in vna_pkts],
-                'time':   meta['time'],
-                'seq':    meta['seq_count'],
-                'src':    meta['src_num'],
-                'app_id': meta['app_id'],
+                'raw':      [pkt.sci_data for pkt in vna_pkts],
+                'time':     primary['time'],
+                'seq':      primary['seq'],
+                'src':      primary['src'],
+                'metadata': metadata,
             }
 
         # ---------- 2c. 温度数据（TEMP）----------
         temp_pkts = separated.get('TEMP', [])
         if temp_pkts:
-            meta = self.metadata_extractor.extract_arrays(temp_pkts)
+            primary, metadata = self.metadata_extractor.extract_arrays(temp_pkts)
             logger.info(f"TEMP: {len(temp_pkts)} packets")
             result['temp'] = {
-                'raw':    [pkt.sci_data for pkt in temp_pkts],
-                'time':   meta['time'],
-                'seq':    meta['seq_count'],
-                'src':    meta['src_num'],
-                'app_id': meta['app_id'],
+                'raw':      [pkt.sci_data for pkt in temp_pkts],
+                'time':     primary['time'],
+                'seq':      primary['seq'],
+                'src':      primary['src'],
+                'metadata': metadata,
             }
 
         # ---------- 2d. 未知类型 ----------
@@ -609,7 +634,7 @@ class HongMengFileProcessor:
 
     @staticmethod
     def _save_result(file_path: Path, result: Dict):
-        """保存结果（嵌套 dict 展平为 type_field 格式后保存）"""
+        """保存结果（嵌套 dict 展平为 type_field / type_meta_field 格式后保存）"""
         output_path = file_path.parent / f"{file_path.stem}_Parced_v3.npz"
         logger.info(f"Saving to {output_path.name}")
         save_data = {}
@@ -617,11 +642,15 @@ class HongMengFileProcessor:
             if not isinstance(sub_dict, dict):
                 continue
             for field, value in sub_dict.items():
-                flat_key = f"{type_key}_{field}"
-                if isinstance(value, list):
-                    save_data[flat_key] = np.array(value, dtype=object)
+                if field == 'metadata' and isinstance(value, dict):
+                    for mf, mv in value.items():
+                        flat_key = f"{type_key}_meta_{mf}"
+                        if isinstance(mv, (np.ndarray, int, float, str)):
+                            save_data[flat_key] = mv
+                elif isinstance(value, list):
+                    save_data[f"{type_key}_{field}"] = np.array(value, dtype=object)
                 elif isinstance(value, (np.ndarray, int, float, str)):
-                    save_data[flat_key] = value
+                    save_data[f"{type_key}_{field}"] = value
         np.savez_compressed(output_path, **save_data)
         logger.info("Saved successfully")
 
@@ -659,7 +688,14 @@ if __name__ == '__main__':
         sub = result[type_key]
         print(f"\n[{type_key}]:")
         for field, value in sub.items():
-            if hasattr(value, 'shape'):
+            if field == 'metadata':
+                print(f"  metadata:")
+                for mf, mv in value.items():
+                    if hasattr(mv, 'shape'):
+                        print(f"    {mf}: shape={mv.shape}, dtype={mv.dtype}")
+                    else:
+                        print(f"    {mf}: {mv}")
+            elif hasattr(value, 'shape'):
                 print(f"  {field}: shape={value.shape}, dtype={value.dtype}")
             elif isinstance(value, list):
                 print(f"  {field}: list len={len(value)}")
