@@ -31,7 +31,7 @@ PACKET_SRC_NUM_SIZE = 1               # 被测源序列号
 PACKET_VALID_LEN_SIZE = 3             # 有效数据域长度字段
 PACKET_CHECKSUM_SIZE = 2              # 校验和
 # 包数据域 = 时间(8) + 被测源序列号(1) + 有效数据域长度(3) + 有效数据(N) + 校验和(2)
-# 注意：校验和属于包数据域的一部分，data_len 字段值已包含校验和
+
 PACKET_DATA_DOMAIN_OVERHEAD = PACKET_TIME_SIZE + PACKET_SRC_NUM_SIZE + PACKET_VALID_LEN_SIZE + PACKET_CHECKSUM_SIZE  # 14 bytes
 
 # 应用过程标识符（11 bits）→ 数据类型
@@ -109,7 +109,7 @@ class PacketParser:
         return sum(data) & 0xFFFF
 
     def parse_packet(self, buf: bytes | memoryview) -> Optional[SpecPacket]:
-        """解析单个数据包（新格式：支持 SPEC/VNA/TEMP 三种类型）
+        """解析单个数据包
 
         包结构：
           sync(2) | pkt_id(2) | seq_ctrl(2) | data_len_field(3)  ← PACKET_HEADER_SIZE=9
