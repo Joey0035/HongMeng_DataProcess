@@ -56,6 +56,12 @@ CHANNELS_PER_SPEC = 4
 VALUES_PER_CHANNEL = 4096
 BYTES_PER_VALUE = 9
 
+# VNA 常数
+VNA_HEADER_SIZE = 4           # 计算请求总计数(2B) + 计算请求计数(2B)
+VNA_IQ_BYTES = 6              # 每个 I/Q 值 48 bit = 6 字节
+VNA_FREQ_POINT_SIZE = 24      # 每频点 = 4 × 6 字节 (Iref, Qref, Irfl, Qrfl)
+VNA_MAX_FREQ_PER_PKT = 100   # 每包最多 100 个频点
+
 # 数据包类型字面量（供类型标注使用）
 PktDataType = str  # 'SPEC' | 'VNA' | 'TEMP' | 'UNKNOWN'
 
@@ -374,7 +380,6 @@ class PacketParser:
 
 # %%
 class SciDataProcessor:
-    """科学数据处理器 """
 
     @staticmethod
     def bytes_to_int64_vec(data_views: list) -> np.ndarray:
@@ -418,6 +423,142 @@ class SciDataProcessor:
                 result[class_idx] = SciDataProcessor.bytes_to_int64_vec(data_views)
 
         return result
+
+    @staticmethod
+    def _read_signed48(data: bytes, offset: int) -> int:
+        """读取 48-bit 有符号整数 (big-endian, 二进制补码)"""
+        val = int.from_bytes(data[offset:offset + 6], 'big')
+        if val >= (1 << 47):
+            val -= (1 << 48)
+        return val
+
+    @staticmethod
+    def process_vna_sweep(sweep_pkts: list) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """处理单次 VNA 扫频（由 group_flag 分组的多个包）
+
+        VNA 包科学数据域结构：
+          [0:2]  计算请求总计数 (uint16)
+          [2:4]  计算请求计数   (uint16)
+          [4:]   频点数据，每频点 24 字节: Iref(6) Qref(6) Irfl(6) Qrfl(6)
+                 最后一包有效频点数 = (valid_data_len - 4) / 24
+
+        Returns
+        -------
+        (s11, iref, qref, irfl, qrfl) — 每个为 (n_freq,) complex128/int64
+            s11:  S11 线性值 (复数), = (Irfl + j*Qrfl) / (Iref + j*Qref)
+            iref, qref, irfl, qrfl: 原始 IQ 值 (int64)
+        """
+        all_iref, all_qref, all_irfl, all_qrfl = [], [], [], []
+
+        for pkt in sweep_pkts:
+            sd = pkt.sci_data
+            n_freq = (pkt.valid_data_len - VNA_HEADER_SIZE) // VNA_FREQ_POINT_SIZE
+
+            for fi in range(n_freq):
+                base = VNA_HEADER_SIZE + fi * VNA_FREQ_POINT_SIZE
+                all_iref.append(SciDataProcessor._read_signed48(sd, base))
+                all_qref.append(SciDataProcessor._read_signed48(sd, base + 6))
+                all_irfl.append(SciDataProcessor._read_signed48(sd, base + 12))
+                all_qrfl.append(SciDataProcessor._read_signed48(sd, base + 18))
+
+        iref  = np.array(all_iref,  dtype=np.int64)
+        qref  = np.array(all_qref,  dtype=np.int64)
+        irfl  = np.array(all_irfl,  dtype=np.int64)
+        qrfl  = np.array(all_qrfl,  dtype=np.int64)
+
+        # S11 = (Irfl + j*Qrfl) / (Iref + j*Qref)
+        incident   = iref.astype(np.float64) + 1j * qref.astype(np.float64)
+        reflection = irfl.astype(np.float64) + 1j * qrfl.astype(np.float64)
+        # 避免除零
+        with np.errstate(divide='ignore', invalid='ignore'):
+            s11 = np.where(np.abs(incident) > 0, reflection / incident, 0.0 + 0j)
+
+        return s11, iref, qref, irfl, qrfl
+
+    @staticmethod
+    def process_all_vna(vna_pkts: list) -> Dict[str, np.ndarray]:
+        """处理所有 VNA 包，按 group_flag 分组成扫频
+
+        Returns
+        -------
+        dict:
+            's11':             (n_sweep, n_freq) complex128  — S11 线性值
+            'iref':            (n_sweep, n_freq) int64
+            'qref':            (n_sweep, n_freq) int64
+            'irfl':            (n_sweep, n_freq) int64
+            'qrfl':            (n_sweep, n_freq) int64
+            'sweep_time':      (n_sweep,) float64  — 每次扫频起始时间
+            'sweep_src':       (n_sweep,) uint8   — 每次扫频的被测源
+            'n_freq_per_sweep':(n_sweep,) int32   — 每次扫频的频点数
+            'calc_total_count':(n_sweep,) uint16  — 计算请求总计数
+        """
+        if not vna_pkts:
+            return {}
+
+        # 按 group_flag 分组成扫频
+        sweeps: List[list] = []
+        current: list = []
+        for pkt in vna_pkts:
+            if pkt.group_flag == 1:  # 起始包
+                if current:
+                    sweeps.append(current)
+                current = [pkt]
+            else:
+                current.append(pkt)
+        if current:
+            sweeps.append(current)
+
+        logger.info(f"VNA: {len(sweeps)} sweeps from {len(vna_pkts)} packets")
+
+        # 处理每次扫频
+        sweep_s11, sweep_iref, sweep_qref, sweep_irfl, sweep_qrfl = [], [], [], [], []
+        sweep_time, sweep_src, n_freq_list, total_count_list = [], [], [], []
+
+        for sweep in sweeps:
+            s11, iref, qref, irfl, qrfl = SciDataProcessor.process_vna_sweep(sweep)
+            sweep_s11.append(s11)
+            sweep_iref.append(iref)
+            sweep_qref.append(qref)
+            sweep_irfl.append(irfl)
+            sweep_qrfl.append(qrfl)
+            sweep_time.append(sweep[0].seconds + sweep[0].microseconds * 1e-6)
+            sweep_src.append(sweep[0].src_num)
+            n_freq_list.append(len(s11))
+            total_count_list.append(int.from_bytes(sweep[0].sci_data[0:2], 'big'))
+
+        # 如果所有扫频频点数相同，可以堆成规整 2D 数组
+        n_freq_arr = np.array(n_freq_list, dtype=np.int32)
+        if np.all(n_freq_arr == n_freq_arr[0]):
+            s11_out   = np.stack(sweep_s11)
+            iref_out  = np.stack(sweep_iref)
+            qref_out  = np.stack(sweep_qref)
+            irfl_out  = np.stack(sweep_irfl)
+            qrfl_out  = np.stack(sweep_qrfl)
+        else:
+            # 频点数不一致，用 object 数组
+            s11_out   = np.empty(len(sweeps), dtype=object)
+            iref_out  = np.empty(len(sweeps), dtype=object)
+            qref_out  = np.empty(len(sweeps), dtype=object)
+            irfl_out  = np.empty(len(sweeps), dtype=object)
+            qrfl_out  = np.empty(len(sweeps), dtype=object)
+            for i in range(len(sweeps)):
+                s11_out[i]  = sweep_s11[i]
+                iref_out[i] = sweep_iref[i]
+                qref_out[i] = sweep_qref[i]
+                irfl_out[i] = sweep_irfl[i]
+                qrfl_out[i] = sweep_qrfl[i]
+
+        return {
+            's11':              s11_out,
+            'iref':             iref_out,
+            'qref':             qref_out,
+            'irfl':             irfl_out,
+            'qrfl':             qrfl_out,
+            'sweep_time':       np.array(sweep_time,       dtype=np.float64),
+            'sweep_src':        np.array(sweep_src,        dtype=np.uint8),
+            'n_freq_per_sweep': n_freq_arr,
+            'calc_total_count': np.array(total_count_list, dtype=np.uint16),
+        }
 
     @staticmethod
     def process_all_specs(packets: list) -> np.ndarray:
@@ -560,7 +701,9 @@ class HongMengFileProcessor:
             },
         }
 
-        result['vna']  = { 'raw', 'time', 'seq', 'src', 'metadata': {...} }
+        result['vna']  = { 'data': {s11, iref, qref, irfl, qrfl,
+                            sweep_time, sweep_src, n_freq_per_sweep, calc_total_count},
+                           'raw', 'time', 'seq', 'src', 'metadata': {...} }
         result['temp'] = { 'raw', 'time', 'seq', 'src', 'metadata': {...} }
 
         通过 metadata[field][i] 可快速定位第 i 个包的任意包头字段。
@@ -621,11 +764,16 @@ class HongMengFileProcessor:
         vna_pkts = separated.get('VNA', [])
         if vna_pkts:
             primary, metadata = self.metadata_extractor.extract_arrays(vna_pkts)
-            logger.info(f"VNA: {len(vna_pkts)} packets")
+            logger.info(f"VNA: {len(vna_pkts)} packets, processing S parameters...")
             vna_raw = np.empty(len(vna_pkts), dtype=object)
             for i, pkt in enumerate(vna_pkts):
                 vna_raw[i] = pkt.sci_data
+
+            # 解码 VNA S 参数
+            vna_data = self.sci_processor.process_all_vna(vna_pkts)
+
             result['vna'] = {
+                'data':     vna_data,       # dict: s11, iref, qref, irfl, qrfl, sweep_time, ...
                 'raw':      vna_raw,
                 'time':     primary['time'],
                 'seq':      primary['seq'],
@@ -689,7 +837,7 @@ class HongMengFileProcessor:
 
     @staticmethod
     def _save_result(file_path: Path, result: Dict):
-        """保存结果（展平为 type_field / type_meta_field 格式）"""
+        """保存结果（展平为 type_field / type_meta_field / type_data_field 格式）"""
         output_path = file_path.parent / f"{file_path.stem}_Parced_v3.npz"
         logger.info(f"Saving to {output_path.name}")
         save_data = {}
@@ -701,6 +849,11 @@ class HongMengFileProcessor:
                     for mf, mv in value.items():
                         if isinstance(mv, (np.ndarray, int, float, str)):
                             save_data[f"{type_key}_meta_{mf}"] = mv
+                elif field == 'data' and isinstance(value, dict):
+                    # VNA data dict: s11, iref, qref, irfl, qrfl, ...
+                    for df, dv in value.items():
+                        if isinstance(dv, (np.ndarray, int, float, str)):
+                            save_data[f"{type_key}_data_{df}"] = dv
                 elif isinstance(value, (np.ndarray, int, float, str)):
                     save_data[f"{type_key}_{field}"] = value
         np.savez_compressed(output_path, **save_data)
@@ -866,6 +1019,13 @@ if __name__ == '__main__':
                         print(f"    {mf}: shape={mv.shape}, dtype={mv.dtype}")
                     else:
                         print(f"    {mf}: {mv}")
+            elif field == 'data' and isinstance(value, dict):
+                print(f"  data:")
+                for df, dv in value.items():
+                    if hasattr(dv, 'shape'):
+                        print(f"    {df}: shape={dv.shape}, dtype={dv.dtype}")
+                    else:
+                        print(f"    {df}: {dv}")
             elif hasattr(value, 'shape'):
                 print(f"  {field}: shape={value.shape}, dtype={value.dtype}")
             elif isinstance(value, list):

@@ -1,303 +1,281 @@
-# DSL_TestPlatform operating handbook
+# DSL_TestPlatform Operating Handbook
 
+## 概述
 
+`HongMeng_raw_data_Parser.py` 用于解析 DSL FPGA 数据采集系统原始 `.dat` 文件，支持三种数据类型的解包与处理。
 
-## 📋 
-
-`HongMeng_raw_data_Parser.py` 用于解析 DSL FPGA 数据采集系统原始 `.dat` 文件。
-
-**版本**: v3.0  
-**作者**: JoeyXu  
-**日期**: 2026-01-29
+**版本**: v3.2
+**作者**: JoeyXu
+**日期**: 2026-04-03
 
 ---
 
-## ✨ 主要特性
+## 主要特性
 
-### 🚀 性能优化
+- **多类型数据解包**：SPEC 相关器 / VNA S参数 / 温度数据一次解析
+- **VNA S参数解码**：自动按扫频分组，计算 S11 线性复数值
 - **流式分块读取**：自动选择整读或分块模式（默认阈值 512MB）
-- **批量 Numpy 操作**：减少 Python 循环开销 20-40%
-- **预分配内存**：降低内存峰值 30-50%
-- **智能缓冲管理**：动态调整缓冲区大小
-
-### 🛡️ 稳定性保障
-- **完整错误捕获**：自动跳过损坏的数据包
-- **数据一致性验证**：检查元数据完整性
-- **自动内存管理**：定期垃圾回收，防止内存泄漏
-
-### 📊 实时监控
-- **结构化日志**：详细的处理进度和状态信息
-- **进度追踪**：实时显示已处理字节数和包数量
-- **错误统计**：记录并汇总解析错误
+- **解包日志**：每次解包自动生成 `_parse.log`，记录丢弃包详情和 hex 原始数据
+- **Checksum 校验**：逐包验证，错误包自动丢弃并记录
+- **ndarray 统一封装**：所有输出数据均为 numpy 数组
 
 ---
 
-## 📦 安装和依赖
+## 安装和依赖
 
-### 环境要求
 - Python 3.9+
 - numpy >= 1.20.0
 
-### 安装依赖
 ```bash
 pip install numpy
 ```
 
 ---
 
-## 🚀 快速开始
+## 快速开始
 
-### 基本用法
+### Python 调用
 
 ```python
-from unpack_DSLcorr_v3_optimized import run_ParceSpecPacket
-from pathlib import Path
+from HongMeng_raw_data_Parser import HongMengFileProcessor
 
-# 解析文件
-result = run_ParceSpecPacket(
-    file_dir='your_data.dat',
-    skip_pkt=0,          # 跳过的包数量
-    save=True            # 是否保存为 npz 文件
-)
+processor = HongMengFileProcessor(verbose=True)
+result = processor.process_file('your_data.dat', save=True)
 
-# 访问结果
-print(f"解析得到 {result['sci_data'].shape[0]} 个频谱")
-print(f"数据形状: {result['sci_data'].shape}")  # (n_specs, 4, 4096)
+# SPEC 数据
+spec = result['spec']
+fft_data = spec['data']          # (n_fft, 4, 4096) int64
+auto_A = fft_data[0, 0, :]      # 第 0 次 FFT 的 A 路自相关
+
+# VNA S参数
+vna = result['vna']
+s11 = vna['data']['s11'][0]      # 第 0 次扫频的 S11 复数
+mag_dB = 20 * np.log10(np.abs(s11))
+
+# 温度
+temp = result['temp']
+temp_raw = temp['raw']           # 每包 75 字节原始数据
 ```
 
-### 命令行使用
+### 兼容接口
+
+```python
+from HongMeng_raw_data_Parser import run_ParceSpecPacket
+
+result = run_ParceSpecPacket('your_data.dat', skip_pkt=0, save=True)
+```
+
+### 命令行
 
 ```bash
-python unpack_DSLcorr_v3_optimized.py <file_path> [skip_pkt] [save]
-
-# 示例
-python unpack_DSLcorr_v3_optimized.py data.dat 0 true
+python HongMeng_raw_data_Parser.py <file_path> [skip_pkt] [save]
+python HongMeng_raw_data_Parser.py data.dat 0 true
 ```
 
 ---
 
-## 📖 API 文档
+## API 参数
 
-### 主函数：`run_ParceSpecPacket()`
-
-解析 DSL 原始数据文件并提取科学数据。
-
-#### 参数
+### `HongMengFileProcessor.process_file()`
 
 | 参数名             | 类型            | 默认值 | 说明                         |
 | ------------------ | --------------- | ------ | ---------------------------- |
-| `file_dir`         | `str` \| `Path` | 必需   | 输入文件路径                 |
-| `skip_pkt`         | `int`           | 0      | 跳过的数据包数量（用于对齐） |
-| `save`             | `bool`          | False  | 是否保存为压缩 npz 文件      |
-| `chunk_size`       | `int`           | 64MB   | 分块读取大小（字节）         |
+| `file_path`        | `str` \| `Path` | 必需   | 输入 `.dat` 文件路径         |
+| `skip_pkt`         | `int`           | 0      | SPEC 跳过的包数量（用于对齐）|
+| `save`             | `bool`          | False  | 是否保存为 `.npz` 文件       |
+| `chunk_size`       | `int`           | 64MB   | 流式读取分块大小（字节）     |
 | `stream_threshold` | `int`           | 512MB  | 触发流式读取的文件大小阈值   |
 
-#### 返回值
+---
 
-返回字典，包含以下键：
+## 返回值结构
 
-```python
-{
-    'version': int,              # 协议版本
-    'pkt_type': int,            # 包类型
-    'sec_hdr_flag': int,        # 副头标志
-    'app_id': int,              # 应用ID
-    'group_flag': np.ndarray,   # 分组标志 (n_packets,)
-    'seq_count': np.ndarray,    # 序列号 (n_packets,)
-    'time': np.ndarray,         # 时间戳 (n_packets,)
-    'sci_data': np.ndarray      # 科学数据 (n_specs, 4, 4096)
-}
+`process_file()` 返回 `dict`，按数据类型分为三个顶层 key：
+
+```
+result
+├── "spec"   — 相关器数据 (app_id=0x000)
+├── "vna"    — VNA S参数数据 (app_id=0x7FF)
+└── "temp"   — 温度数据 (app_id=0x7C0)
 ```
 
-#### 科学数据结构
+### result["spec"]
 
-`sci_data` 形状为 `(n_specs, 4, 4096)`：
-- **维度 0**: 频谱数量（FFT 数量）
-- **维度 1**: 4 个通道
-  - `[0]`: auto1（自相关1）
-  - `[1]`: auto2（自相关2）
-  - `[2]`: corr_img（互相关虚部）
-  - `[3]`: corr_real（互相关实部）
-- **维度 2**: 4096 个频率点（对应 0-250 MHz）
+```
+spec
+├── data              (n_fft, 4, 4096)  int64     解码后科学数据
+│                      [i,0,:]=A自相关  [i,1,:]=B自相关
+│                      [i,2,:]=互相关虚部  [i,3,:]=互相关实部
+├── raw               (n_pkt,)          object    每包原始科学数据 bytes
+├── time              (n_pkt,)          float64   时间戳
+├── seq               (n_pkt,)          uint16    包序列计数
+├── src               (n_pkt,)          uint8     被测源序列号
+└── metadata
+    ├── app_id        (n_pkt,)          uint16
+    ├── version       (n_pkt,)          uint8
+    ├── pkt_type      (n_pkt,)          uint8
+    ├── sec_hdr_flag  (n_pkt,)          uint8
+    ├── group_flag    (n_pkt,)          uint8
+    ├── data_len      (n_pkt,)          uint32
+    ├── valid_data_len(n_pkt,)          uint32
+    └── checksum      (n_pkt,)          uint16
+```
+
+> n_fft = n_pkt // 64。尾部不足 64 包的 SPEC 包被对齐丢弃（详见 parse.log）。
+
+### result["vna"]
+
+```
+vna
+├── data                                          VNA 解码数据（按扫频组织）
+│   ├── s11              (n_sweep, n_freq) complex128    S11 线性复数值
+│   ├── iref             (n_sweep, n_freq) int64         入射 I (48-bit signed)
+│   ├── qref             (n_sweep, n_freq) int64         入射 Q
+│   ├── irfl             (n_sweep, n_freq) int64         反射 I
+│   ├── qrfl             (n_sweep, n_freq) int64         反射 Q
+│   ├── sweep_time       (n_sweep,)        float64       扫频起始时间
+│   ├── sweep_src        (n_sweep,)        uint8         扫频被测源
+│   ├── n_freq_per_sweep (n_sweep,)        int32         每次扫频频点数
+│   └── calc_total_count (n_sweep,)        uint16        计算请求总计数
+├── raw               (n_pkt,)            object    每包原始科学数据 bytes
+├── time              (n_pkt,)            float64   时间戳
+├── seq               (n_pkt,)            uint16    包序列计数
+├── src               (n_pkt,)            uint8     被测源序列号
+└── metadata          ...                           (同 SPEC)
+```
+
+> S11 = (Irfl + j\*Qrfl) / (Iref + j\*Qref)。当各扫频频点数不一致时，s11/iref/qref/irfl/qrfl 退化为 `(n_sweep,) object` 数组。
+
+### result["temp"]
+
+```
+temp
+├── raw               (n_pkt,)          object    每包原始科学数据 (75 bytes)
+├── time              (n_pkt,)          float64   时间戳
+├── seq               (n_pkt,)          uint16    包序列计数
+├── src               (n_pkt,)          uint8     被测源序列号
+└── metadata          ...                         (同 SPEC)
+```
+
+> 温度数据目前未做进一步解码。
+
+详细结构文档见 [result_structure.txt](result_structure.txt)
 
 ---
 
-## 🔧 高级用法
+## 数据包格式
 
-### 自定义参数
+### 通用包结构
 
-```python
-# 处理超大文件（降低阈值启用流式读取）
-result = run_ParceSpecPacket(
-    file_dir='huge_file.dat',
-    stream_threshold=256 * 1024 * 1024,  # 256MB
-    chunk_size=32 * 1024 * 1024,         # 32MB 分块
-    save=True
-)
-
-# 强制使用整读模式（小文件或内存充足）
-result = run_ParceSpecPacket(
-    file_dir='small_file.dat',
-    stream_threshold=float('inf'),  # 永远不触发流式读取
-    save=False
-)
+```
+┌──────────────────────────────────────────────────────────────┐
+│ 同步码 (2B): 0xEB90                                         │
+│ 包标识 (2B): version(3b) | type(1b) | sec_hdr(1b) | app_id(11b) │
+│ 包序控制 (2B): group_flag(2b) | seq_count(14b)              │
+│ 数据域长度 (3B): 包数据域字节数 - 1                           │
+├──── 包数据域 ────────────────────────────────────────────────┤
+│ 时间码 (8B): seconds(4B) + microseconds(4B)                 │
+│ 被测源序列号 (1B)                                            │
+│ 有效数据域长度 (3B): 有效数据字节数 - 1                       │
+│ 科学数据 (N B)                                               │
+│ 校验和 (2B): 副导头+有效数据域 按字节累加取低 16bit          │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-### 面向对象接口
+### 数据类型区分 (app_id)
+
+| app_id | 类型 | 科学数据 N | 总包长 |
+| ------ | ---- | ---------- | ------ |
+| 0x000  | SPEC | 2304       | 2327   |
+| 0x7FF  | VNA  | 2404       | 2427   |
+| 0x7C0  | TEMP | 75         | 98     |
+
+### VNA 包科学数据域
+
+```
+[0:2]  计算请求总计数 (uint16 big-endian)
+[2:4]  计算请求计数   (uint16 big-endian)
+[4:]   频点数据, 每频点 24 字节:
+       Iref(6B) | Qref(6B) | Irfl(6B) | Qrfl(6B)
+       各为 48-bit signed big-endian
+       不足部分填充 0x7E
+```
+
+---
+
+## 输出文件
+
+| 文件 | 条件 | 说明 |
+| ---- | ---- | ---- |
+| `{stem}_Parced_v3.npz` | `save=True` | numpy 压缩归档 |
+| `{stem}_parse.log`     | 始终生成     | 解包日志 |
+
+### NPZ key 命名
+
+```
+{type}_{field}          — 主字段        如 spec_data, vna_raw
+{type}_meta_{field}     — metadata      如 spec_meta_app_id
+{type}_data_{field}     — VNA data 子dict  如 vna_data_s11
+```
+
+---
+
+## 高级用法
 
 ```python
-from unpack_DSLcorr_v3_optimized import DSLFileProcessor
-
-# 创建处理器实例
-processor = DSLFileProcessor(verbose=True)
-
-# 处理文件
+# 大文件：降低阈值启用流式
 result = processor.process_file(
-    file_path='data.dat',
-    skip_pkt=0,
-    save=True,
-    chunk_size=64 * 1024 * 1024,
-    stream_threshold=512 * 1024 * 1024
+    'huge.dat',
+    stream_threshold=256 * 1024 * 1024,
+    chunk_size=32 * 1024 * 1024,
 )
+
+# SPEC 对齐：跳过前 N 个包
+result = processor.process_file('data.dat', skip_pkt=64)
 ```
 
 ---
 
-## 📝 数据格式说明
+## 常见问题
 
-### 输入格式（.dat 文件）
+### 内存不足
+降低 `stream_threshold` 和 `chunk_size`。
 
-原始二进制数据包格式：
+### 解析错误过多
+查看 `_parse.log` 中丢弃包详情。错误率 > 5% 建议检查原始数据。
 
-```
-┌─────────────────────────────────────────┐
-│ 同步码 (2 bytes): 0xEB90                 │
-│ 包标识 (2 bytes): version/type/app_id   │
-│ 包序控制 (2 bytes): group_flag/seq      │
-│ 数据长度 (3 bytes)                       │
-│ 时间码 (8 bytes): seconds/microseconds  │
-│ 科学数据 (2304 bytes): 256×9 bytes      │
-│ 校验和 (2 bytes)                         │
-└─────────────────────────────────────────┘
-```
+### SPEC 数据量比包数少
+SPEC 每 64 包组成一次 FFT，尾部不足 64 包的被丢弃。丢弃包记录在 parse.log 中。
 
-### 输出格式（.npz 文件，暂定，后续会更改为HDF5）
-
-压缩 numpy 归档文件，包含所有元数据和科学数据。
-
-```python
-# 加载输出文件
-import numpy as np
-data = np.load('output_Parced_v3.npz')
-
-# 访问数据
-version = data['version']
-sci_data = data['sci_data']  # 形状: (n_specs, 4, 4096)
-time = data['time']          # 时间戳数组
-```
+### VNA S11 形状是 object 而非 2D
+各扫频频点数不一致时自动退化为 object 数组，每个元素为 1D ndarray。
 
 ---
 
-## 🔍 日志示例
+## 版本历史
 
-```
-2026-01-29 14:30:15 - INFO - Starting DSL file processing: 2026012307.dat
-2026-01-29 14:30:15 - INFO - Using streaming mode (file size: 1.85 GB)
-2026-01-29 14:30:15 - INFO - Starting streaming parse of 2026012307.dat (1.85 GB)
-2026-01-29 14:30:25 - INFO - Progress: 0.64 GB / 1.85 GB (125896 packets)
-2026-01-29 14:30:35 - INFO - Progress: 1.28 GB / 1.85 GB (251024 packets)
-2026-01-29 14:30:42 - INFO - Parsing complete: 363520 packets, 23 errors
-2026-01-29 14:30:42 - INFO - Parsed 363520 packets
-2026-01-29 14:30:42 - INFO - Alignment: 5680 FFTs, 0 packets dropped
-2026-01-29 14:30:42 - INFO - Metadata: v0, type=0, app_id=2047
-2026-01-29 14:30:42 - INFO - Processing scientific data...
-2026-01-29 14:30:50 - INFO - Sci data shape: (5680, 4, 4096)
-2026-01-29 14:30:50 - INFO - Processing complete!
-```
-
----
-
-## ⚠️ 常见问题
-
-### Q1: 内存不足错误
-
-**问题**: `MemoryError` 或系统内存耗尽
-
-**解决方案**:
-```python
-# 降低阈值启用流式读取
-result = run_ParceSpecPacket(
-    file_dir='data.dat',
-    stream_threshold=256 * 1024 * 1024,  # 256MB
-    chunk_size=32 * 1024 * 1024          # 32MB
-)
-```
-
-### Q2: 解析出错数量过多
-
-**问题**: 日志显示大量错误包
-
-**原因**: 
-- 文件损坏
-- 同步码丢失
-- 数据传输错误
-
-**检查方法**:
-```python
-result = run_ParceSpecPacket('data.dat')
-error_rate = parser.error_count / parser.packet_count
-print(f"错误率: {error_rate:.2%}")
-# 如果错误率 > 5%，建议检查原始数据
-```
-
-### Q3: 处理速度慢
-
-**优化建议**:
-1. 如果内存充足，提高阈值使用整读模式
-2. 增大 `chunk_size`（如 128MB）
-3. 关闭不必要的日志（设置日志级别为 WARNING）
-
-```python
-import logging
-logging.getLogger().setLevel(logging.WARNING)
-```
-
-### Q4: 数据对齐问题
-
-**问题**: 源序列与数据不匹配
-
-**解决方案**:
-```python
-# 使用 skip_pkt 参数跳过前面的包
-result = run_ParceSpecPacket(
-    file_dir='data.dat',
-    skip_pkt=64  # 跳过前 64 个包（1 个完整频谱）
-)
-```
-
----
-
-## 🔄 版本更新历史
+### v3.2 (2026-04-03)
+- 新增 VNA S参数解码（S11 线性值、原始 IQ）
+- 新增解包日志 `_parse.log`
+- result 结构重构：metadata 子 dict、per-packet raw、ndarray 统一封装
+- 修复 checksum 域长度计算 bug
+- 修复 TEMP 包最小长度校验 bug
+- 修复 VNA 包 sci_data 物理空间计算 bug
 
 ### v3.0 (2026-01-29)
-- ✅ 完全重构，采用面向对象设计
-- ✅ 新增流式分块读取支持
-- ✅ 批量 numpy 操作，性能提升 30-50%
-- ✅ 预分配内存，降低内存峰值 40-60%
-- ✅ 结构化日志系统
-- ✅ 修复 bytes 对象不可变导致的 bug
+- 完全重构，面向对象设计
+- 流式分块读取、批量 numpy、预分配内存
+- 结构化日志系统
 
 ### v2.1 (2026-01-06)
-- ✅ 支持 checksum 校验
-- ✅ 添加 group_flag 和 seq_count 提取
+- 支持 checksum 校验
 
 ### v2.0 (2025-12-16)
-- ✅ 重构数据解析逻辑
-- ✅ 支持多通道科学数据提取
+- 重构数据解析逻辑，多通道科学数据
 
 ### v1.0 (2025-11-20)
-- ✅ 初始版本
+- 初始版本
 
 ---
 
-**最后更新**: 2026-01-29
+**最后更新**: 2026-04-03
