@@ -4,9 +4,9 @@
 
 `HongMeng_raw_data_Parser.py` 用于解析 DSL FPGA 数据采集系统原始 `.dat` 文件，支持三种数据类型的解包与处理。
 
-**版本**: v3.2
+**版本**: v3.3
 **作者**: JoeyXu
-**日期**: 2026-04-03
+**日期**: 2026-04-07
 
 ---
 
@@ -14,6 +14,8 @@
 
 - **多类型数据解包**：SPEC 相关器 / VNA S参数 / 温度数据一次解析
 - **VNA S参数解码**：自动按扫频分组，计算 S11 线性复数值
+- **TEMP 温度解码**：offset-binary 24-bit → PT1000 CVD 逆公式 → ℃，输出 (n_pkt, 5, 5)
+- **观测序列还原**：从 src 中自动检测预设观测序列（源的排列组合），输出 obs_seq
 - **流式分块读取**：自动选择整读或分块模式（默认阈值 512MB）
 - **解包日志**：每次解包自动生成 `_parse.log`，记录丢弃包详情和 hex 原始数据
 - **Checksum 校验**：逐包验证，错误包自动丢弃并记录
@@ -49,12 +51,16 @@ auto_A = fft_data[0, 0, :]      # 第 0 次 FFT 的 A 路自相关
 
 # VNA S参数
 vna = result['vna']
-s11 = vna['data']['s11'][0]      # 第 0 次扫频的 S11 复数
+s11 = vna['data'][0]              # 第 0 次扫频的 S11 复数
 mag_dB = 20 * np.log10(np.abs(s11))
+iref = vna['raw']['iref'][0]     # 第 0 次扫频入射 I
 
 # 温度
 temp = result['temp']
+temp_data = temp['data']         # (n_pkt, 5, 5) float64, ℃，NaN=无效
+t_pkt0 = temp_data[0]            # 第 0 包温度, shape=(5, 5)
 temp_raw = temp['raw']           # 每包 75 字节原始数据
+obs = result['spec']['obs_seq']  # 检测到的观测序列，如 [30,31,...,45,23]
 ```
 
 ### 兼容接口
@@ -110,6 +116,7 @@ spec
 ├── time              (n_pkt,)          float64   时间戳
 ├── seq               (n_pkt,)          uint16    包序列计数
 ├── src               (n_pkt,)          uint8     被测源序列号
+├── obs_seq           (n_sources,)      uint8     检测到的观测序列
 └── metadata
     ├── app_id        (n_pkt,)          uint16
     ├── version       (n_pkt,)          uint8
@@ -127,29 +134,31 @@ spec
 
 ```
 vna
-├── data                                          VNA 解码数据（按扫频组织）
-│   ├── s11              (n_sweep, n_freq) complex128    S11 线性复数值
-│   ├── iref             (n_sweep, n_freq) int64         入射 I (48-bit signed)
-│   ├── qref             (n_sweep, n_freq) int64         入射 Q
-│   ├── irfl             (n_sweep, n_freq) int64         反射 I
-│   ├── qrfl             (n_sweep, n_freq) int64         反射 Q
-│   ├── sweep_time       (n_sweep,)        float64       扫频起始时间
-│   ├── sweep_src        (n_sweep,)        uint8         扫频被测源
-│   ├── n_freq_per_sweep (n_sweep,)        int32         每次扫频频点数
-│   └── calc_total_count (n_sweep,)        uint16        计算请求总计数
-├── raw               (n_pkt,)            object    每包原始科学数据 bytes
-├── time              (n_pkt,)            float64   时间戳
-├── seq               (n_pkt,)            uint16    包序列计数
-├── src               (n_pkt,)            uint8     被测源序列号
-└── metadata          ...                           (同 SPEC)
+├── data              (n_sweep, n_freq) complex128  S11 线性复数值
+│                     或 (n_sweep,) object          = (Irfl+j*Qrfl)/(Iref+j*Qref)
+├── raw               dict                         原始 IQ 值（按扫频组织）
+│   ├── iref          (n_sweep, n_freq) int64       入射 I (48-bit signed)
+│   ├── qref          (n_sweep, n_freq) int64       入射 Q
+│   ├── irfl          (n_sweep, n_freq) int64       反射 I
+│   └── qrfl          (n_sweep, n_freq) int64       反射 Q
+├── time              (n_pkt,)          float64     每包时间戳
+├── seq               (n_pkt,)          uint16      包序列计数
+├── src               (n_pkt,)          uint8       被测源序列号
+├── obs_seq           (n_sources,)      uint8       检测到的观测序列
+├── n_freq_per_sweep  (n_sweep,)        int32       每次扫频频点数
+└── metadata
+    ├── app_id ~ checksum                           (同 SPEC, per-packet)
+    └── calc_total_count (n_sweep,)     uint16      计算请求总计数
 ```
 
-> S11 = (Irfl + j\*Qrfl) / (Iref + j\*Qref)。当各扫频频点数不一致时，s11/iref/qref/irfl/qrfl 退化为 `(n_sweep,) object` 数组。
+> S11 = (Irfl + j\*Qrfl) / (Iref + j\*Qref)。当各扫频频点数不一致时，data 和 raw 各字段退化为 `(n_sweep,) object` 数组。
 
 ### result["temp"]
 
 ```
 temp
+├── data              (n_pkt, 5, 5)    float64   解码温度 (℃)，NaN=异常/未接入
+│                      [i, chip, ch]
 ├── raw               (n_pkt,)          object    每包原始科学数据 (75 bytes)
 ├── time              (n_pkt,)          float64   时间戳
 ├── seq               (n_pkt,)          uint16    包序列计数
@@ -157,7 +166,8 @@ temp
 └── metadata          ...                         (同 SPEC)
 ```
 
-> 温度数据目前未做进一步解码。
+> 75 bytes = 5 chips × 5 channels × 3 bytes (offset-binary 24-bit ADC code)
+> R = (code − 2²³) × 2.5 / (2²³ × 0.5mA)，T = PT1000 CVD 逆公式。
 
 详细结构文档见 [result_structure.txt](result_structure.txt)
 
@@ -213,9 +223,9 @@ temp
 ### NPZ key 命名
 
 ```
-{type}_{field}          — 主字段        如 spec_data, vna_raw
-{type}_meta_{field}     — metadata      如 spec_meta_app_id
-{type}_data_{field}     — VNA data 子dict  如 vna_data_s11
+{type}_{field}          — 主字段        如 spec_data, vna_data
+{type}_meta_{field}     — metadata      如 spec_meta_app_id, vna_meta_calc_total_count
+{type}_raw_{field}      — VNA raw 子dict  如 vna_raw_iref, vna_raw_qrfl
 ```
 
 ---
@@ -254,6 +264,10 @@ SPEC 每 64 包组成一次 FFT，尾部不足 64 包的被丢弃。丢弃包记
 
 ## 版本历史
 
+### v3.3 (2026-04-07)
+- 新增 TEMP 温度解码：offset-binary 24-bit → PT1000 CVD → (n_pkt, 5, 5) float64
+- 新增 obs_seq 字段（SPEC / VNA）：RLE 检测 src 中的预设观测序列，还原源的排列组合
+
 ### v3.2 (2026-04-03)
 - 新增 VNA S参数解码（S11 线性值、原始 IQ）
 - 新增解包日志 `_parse.log`
@@ -278,4 +292,4 @@ SPEC 每 64 包组成一次 FFT，尾部不足 64 包的被丢弃。丢弃包记
 
 ---
 
-**最后更新**: 2026-04-03
+**最后更新**: 2026-04-07

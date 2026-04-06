@@ -22,11 +22,13 @@ result = processor.process_file('data.dat', save=True)
 spec_data = result['spec']['data']           # (n_fft, 4, 4096) int64
 
 # VNA S参数
-s11 = result['vna']['data']['s11'][0]        # 第 0 次扫频 S11 复数值
+s11 = result['vna']['data'][0]              # 第 0 次扫频 S11 复数值
 mag_dB = 20 * np.log10(np.abs(s11))          # |S11| in dB
+iref = result['vna']['raw']['iref'][0]      # 第 0 次扫频入射 I
 
-# 温度
-temp_raw = result['temp']['raw']             # (n_pkt,) 75-byte 原始数据
+# 温度 (5 chips × 5 channels)
+temp_data = result['temp']['data']          # (n_pkt, 5, 5) float64, ℃
+obs_seq   = result['spec']['obs_seq']       # 检测到的观测序列，如 [30,31,...,45,23]
 ```
 
 ## 文档

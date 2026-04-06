@@ -1,6 +1,6 @@
 ================================================================================
   HongMeng Raw Data Parser — result 数据层级结构文档
-  Generated: 2026-04-03
+  Generated: 2026-04-07
 ================================================================================
 
 result = process_file(file_path) 返回一个 dict，按数据类型分为三个顶层 key：
@@ -11,7 +11,7 @@ result = process_file(file_path) 返回一个 dict，按数据类型分为三个
 
 维度说明：
     n_fft   = SPEC 完整 FFT 块数 (每块 64 包)
-    n_pkt   = 该类型的包总数
+    n_pkt   = 该类型的原始包总数
     n_sweep = VNA 扫频次数 (按 group_flag 分组)
     n_freq  = 每次扫频的频点数 (可能不同扫频不一致)
 
@@ -31,6 +31,7 @@ result = process_file(file_path) 返回一个 dict，按数据类型分为三个
   time                  (n_pkt,)                  float64     每包时间戳 (秒+微秒)
   seq                   (n_pkt,)                  uint16      包序列计数
   src                   (n_pkt,)                  uint8       被测源序列号
+  obs_seq               (n_sources,)              uint8       检测到的观测序列（源 ID 按观测顺序）
   metadata              dict →                                per-packet 包头字段
     ├─ app_id           (n_pkt,)                  uint16        应用过程标识符
     ├─ version          (n_pkt,)                  uint8         版本号
@@ -45,12 +46,14 @@ result = process_file(file_path) 返回一个 dict，按数据类型分为三个
   - data 的维度 n_fft = n_pkt // 64，尾部不足 64 包的 SPEC 包被对齐丢弃
   - raw/time/seq/src/metadata 的 n_pkt = n_fft × 64（对齐后的包数）
   - data[i] 对应 raw[i*64 : (i+1)*64] 的 64 个包解码结果
+  - obs_seq: RLE 压缩 src，找首个重复出现的源，截取一个完整周期
 
   使用示例：
     spec = result["spec"]
     fft_0 = spec["data"][0]              # 第 0 次 FFT, shape=(4, 4096)
     auto_A = fft_0[0]                    # A路自相关, shape=(4096,)
     t0 = spec["time"][0]                 # 第 0 包的时间戳
+    spec["obs_seq"]                      # 观测序列，如 [30,31,...,45,23]
     spec["metadata"]["app_id"][100]      # 第 100 包的 app_id
 
 
@@ -60,39 +63,39 @@ result = process_file(file_path) 返回一个 dict，按数据类型分为三个
 
   键                    形状                      类型          说明
   ────────────────────  ────────────────────────  ──────────  ──────────────────────────────
-  data                  dict →                                VNA 解码数据 (按扫频组织)
-    ├─ s11              (n_sweep, n_freq)         complex128  S11 线性复数值
-    │                   或 (n_sweep,) object                  = (Irfl+j*Qrfl)/(Iref+j*Qref)
-    ├─ iref             (n_sweep, n_freq)         int64       入射信号 I 分量 (48-bit signed)
+  data                  (n_sweep, n_freq)         complex128  S11 线性复数值
+                        或 (n_sweep,) object                  = (Irfl+j*Qrfl)/(Iref+j*Qref)
+  raw                   dict →                                原始 IQ 值 (per-sweep)
+    ├─ iref             (n_sweep, n_freq)         int64         入射信号 I (48-bit signed)
     │                   或 (n_sweep,) object
-    ├─ qref             (n_sweep, n_freq)         int64       入射信号 Q 分量 (48-bit signed)
+    ├─ qref             (n_sweep, n_freq)         int64         入射信号 Q
     │                   或 (n_sweep,) object
-    ├─ irfl             (n_sweep, n_freq)         int64       反射信号 I 分量 (48-bit signed)
+    ├─ irfl             (n_sweep, n_freq)         int64         反射信号 I
     │                   或 (n_sweep,) object
-    ├─ qrfl             (n_sweep, n_freq)         int64       反射信号 Q 分量 (48-bit signed)
-    │                   或 (n_sweep,) object
-    ├─ sweep_time       (n_sweep,)                float64     每次扫频起始时间戳
-    ├─ sweep_src        (n_sweep,)                uint8       每次扫频的被测源序列号
-    ├─ n_freq_per_sweep (n_sweep,)                int32       每次扫频的频点数
-    └─ calc_total_count (n_sweep,)                uint16      计算请求总计数
-  raw                   (n_pkt,)                  object      每包原始科学数据 (bytes)
+    └─ qrfl             (n_sweep, n_freq)         int64         反射信号 Q
+                        或 (n_sweep,) object
   time                  (n_pkt,)                  float64     每包时间戳
   seq                   (n_pkt,)                  uint16      包序列计数
   src                   (n_pkt,)                  uint8       被测源序列号
-  metadata              dict →                                (同 SPEC 结构)
-    ├─ app_id           (n_pkt,)                  uint16
-    ├─ version          (n_pkt,)                  uint8
+  obs_seq               (n_sources,)              uint8       检测到的观测序列
+  n_freq_per_sweep      (n_sweep,)                int32       每次扫频的频点数
+  metadata              dict →
+    ├─ app_id           (n_pkt,)                  uint16        per-packet 包头字段
+    ├─ version          (n_pkt,)                  uint8           ↓
     ├─ pkt_type         (n_pkt,)                  uint8
     ├─ sec_hdr_flag     (n_pkt,)                  uint8
     ├─ group_flag       (n_pkt,)                  uint8
     ├─ data_len         (n_pkt,)                  uint32
     ├─ valid_data_len   (n_pkt,)                  uint32
-    └─ checksum         (n_pkt,)                  uint16
+    ├─ checksum         (n_pkt,)                  uint16        ↑
+    └─ calc_total_count (n_sweep,)                uint16      per-sweep 计算请求总计数
 
   注意：
-  - 当所有扫频频点数一致时, s11/iref/qref/irfl/qrfl 为规整 2D ndarray
+  - 当所有扫频频点数一致时, data/raw 各字段为规整 2D ndarray (n_sweep, n_freq)
   - 当频点数不一致时, 退化为 (n_sweep,) object 数组, 每个元素为 1D ndarray
-  - data 按扫频 (sweep) 组织, raw/time/seq/src/metadata 按原始包 (packet) 组织
+  - data/raw/n_freq_per_sweep 按扫频 (sweep) 组织
+  - time/seq/src/obs_seq 及 metadata 中 app_id~checksum 按原始包 (packet) 组织
+  - metadata 中 calc_total_count 按扫频 (sweep) 组织
   - 扫频通过 group_flag 分组: 1=起始包, 0=续包, 2=末尾包
 
   每包科学数据域格式 (2404 bytes):
@@ -104,12 +107,12 @@ result = process_file(file_path) 返回一个 dict，按数据类型分为三个
 
   使用示例：
     vna = result["vna"]
-    s11_sweep0 = vna["data"]["s11"][0]       # 第 0 次扫频的 S11, shape=(n_freq,)
-    mag_dB = 20 * np.log10(np.abs(s11_sweep0))  # |S11| in dB
-    phase = np.angle(s11_sweep0, deg=True)       # S11 相位 (度)
-    iref_0 = vna["data"]["iref"][0]              # 第 0 次扫频入射 I
-    n_freq = vna["data"]["n_freq_per_sweep"][0]  # 第 0 次扫频频点数
-    sweep_t = vna["data"]["sweep_time"]          # 各扫频起始时间
+    s11_sweep0 = vna["data"][0]                  # 第 0 次扫频的 S11, shape=(n_freq,)
+    mag_dB = 20 * np.log10(np.abs(s11_sweep0))   # |S11| in dB
+    phase = np.angle(s11_sweep0, deg=True)        # S11 相位 (度)
+    iref_0 = vna["raw"]["iref"][0]               # 第 0 次扫频入射 I
+    n_freq = vna["n_freq_per_sweep"][0]           # 第 0 次扫频频点数
+    sweep_t = vna["metadata"]["calc_total_count"]  # 各扫频计算请求总计数
 
 
 ================================================================================
@@ -118,6 +121,9 @@ result = process_file(file_path) 返回一个 dict，按数据类型分为三个
 
   键                    形状                      类型          说明
   ────────────────────  ────────────────────────  ──────────  ──────────────────────────────
+  data                  (n_pkt, 5, 5)             float64     解码温度 (℃)
+                                                               [i, chip, ch]
+                                                               NaN 表示传感器异常或断路
   raw                   (n_pkt,)                  object      每包原始科学数据 (bytes, 75B)
   time                  (n_pkt,)                  float64     每包时间戳
   seq                   (n_pkt,)                  uint16      包序列计数
@@ -133,8 +139,15 @@ result = process_file(file_path) 返回一个 dict，按数据类型分为三个
     └─ checksum         (n_pkt,)                  uint16
 
   注意：
-  - 温度数据目前未做进一步解码, raw 中为 75 字节原始科学数据
+  - 75 bytes/packet = 5 chips × 5 channels × 3 bytes (offset-binary 24-bit ADC code)
+  - R = (code − 2²³) × Vref / (2²³ × PGA × Iio)，Vref=2.5V，PGA=1，Iio=0.5mA
+  - T = (−A + √(A²−4B(1−R/R₀))) / (2B)，A=3.9083e-3，B=−5.775e-7，R₀=1000Ω
+  - R ∉ [800, 3000] Ω 时返回 NaN（传感器异常/未接入）
 
+  使用示例：
+    temp = result["temp"]
+    t_pkt0 = temp["data"][0]             # 第 0 包温度, shape=(5, 5)
+    t_chip0 = t_pkt0[0]                  # 芯片 0 的 5 个通道温度
 
 ================================================================================
   NPZ 存储格式 (save=True 时)
@@ -144,17 +157,33 @@ result = process_file(file_path) 返回一个 dict，按数据类型分为三个
 
   key 命名规则:
     {type}_{field}               — 主字段      (如 spec_data, spec_time)
-    {type}_meta_{field}          — metadata 字段 (如 spec_meta_app_id)
-    {type}_data_{field}          — VNA data 字段 (如 vna_data_s11)
+    {type}_meta_{field}          — metadata 字段 (如 spec_meta_app_id, vna_meta_calc_total_count)
+    {type}_raw_{field}           — VNA raw 子字段 (如 vna_raw_iref, vna_raw_qrfl)
 
   示例:
-    spec_data, spec_raw, spec_time, spec_seq, spec_src
+    spec_data, spec_raw, spec_time, spec_seq, spec_src, spec_obs_seq
     spec_meta_app_id, spec_meta_version, ...
-    vna_data_s11, vna_data_iref, vna_data_sweep_time, ...
-    vna_raw, vna_time, vna_seq, vna_src
-    vna_meta_app_id, ...
-    temp_raw, temp_time, temp_seq, temp_src
+    vna_data, vna_time, vna_seq, vna_src, vna_obs_seq, vna_n_freq_per_sweep
+    vna_raw_iref, vna_raw_qref, vna_raw_irfl, vna_raw_qrfl
+    vna_meta_app_id, vna_meta_calc_total_count, ...
+    temp_data, temp_raw, temp_time, temp_seq, temp_src
     temp_meta_app_id, ...
+
+================================================================================
+  三种类型结构对比
+================================================================================
+
+  字段         SPEC                    VNA                      TEMP
+  ──────────  ──────────────────────  ───────────────────────  ──────────────
+  data        (n_fft, 4, 4096) int64  (n_sweep, n_freq) c128   (n_pkt,5,5) f64
+  raw         (n_pkt,) bytes          dict{iref,qref,irfl,qrfl} (n_pkt,) bytes
+  time        (n_pkt,) float64        (n_pkt,) float64         (n_pkt,) float64
+  seq         (n_pkt,) uint16         (n_pkt,) uint16          (n_pkt,) uint16
+  src         (n_pkt,) uint8          (n_pkt,) uint8           (n_pkt,) uint8
+  obs_seq     (n_sources,) uint8      (n_sources,) uint8       —
+  n_freq_..   —                       (n_sweep,) int32         —
+  metadata    per-packet 包头(8项)    per-packet(8项)          per-packet(8项)
+                                      + calc_total_count
 
 ================================================================================
   END

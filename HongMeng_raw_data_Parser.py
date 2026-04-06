@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Author: JoeyXu
-Date: 2026-01-29
+Date: 2026-04-07
 Description: HongMeng原始数据解析
 """
 # %%
@@ -61,6 +61,16 @@ VNA_HEADER_SIZE = 4           # 计算请求总计数(2B) + 计算请求计数(2
 VNA_IQ_BYTES = 6              # 每个 I/Q 值 48 bit = 6 字节
 VNA_FREQ_POINT_SIZE = 24      # 每频点 = 4 × 6 字节 (Iref, Qref, Irfl, Qrfl)
 VNA_MAX_FREQ_PER_PKT = 100   # 每包最多 100 个频点
+
+# TEMP 常数
+TEMP_N_CHIPS     = 5           # AD7124 芯片数
+TEMP_CH_PER_CHIP = 5           # 每芯片通道数
+TEMP_VREF        = 2.5         # 参考电压 (V)
+TEMP_PGA         = 1           # 增益
+TEMP_IIO         = 0.0005      # 激励电流 (A)
+PT1000_A         = 3.9083e-3   # Callendar-Van Dusen 系数 A
+PT1000_B         = -5.775e-7   # Callendar-Van Dusen 系数 B
+PT1000_R0        = 1000.0      # PT1000 标称阻值 (Ω)
 
 # 数据包类型字面量（供类型标注使用）
 PktDataType = str  # 'SPEC' | 'VNA' | 'TEMP' | 'UNKNOWN'
@@ -487,8 +497,6 @@ class SciDataProcessor:
             'qref':            (n_sweep, n_freq) int64
             'irfl':            (n_sweep, n_freq) int64
             'qrfl':            (n_sweep, n_freq) int64
-            'sweep_time':      (n_sweep,) float64  — 每次扫频起始时间
-            'sweep_src':       (n_sweep,) uint8   — 每次扫频的被测源
             'n_freq_per_sweep':(n_sweep,) int32   — 每次扫频的频点数
             'calc_total_count':(n_sweep,) uint16  — 计算请求总计数
         """
@@ -512,7 +520,7 @@ class SciDataProcessor:
 
         # 处理每次扫频
         sweep_s11, sweep_iref, sweep_qref, sweep_irfl, sweep_qrfl = [], [], [], [], []
-        sweep_time, sweep_src, n_freq_list, total_count_list = [], [], [], []
+        n_freq_list, total_count_list = [], []
 
         for sweep in sweeps:
             s11, iref, qref, irfl, qrfl = SciDataProcessor.process_vna_sweep(sweep)
@@ -521,8 +529,6 @@ class SciDataProcessor:
             sweep_qref.append(qref)
             sweep_irfl.append(irfl)
             sweep_qrfl.append(qrfl)
-            sweep_time.append(sweep[0].seconds + sweep[0].microseconds * 1e-6)
-            sweep_src.append(sweep[0].src_num)
             n_freq_list.append(len(s11))
             total_count_list.append(int.from_bytes(sweep[0].sci_data[0:2], 'big'))
 
@@ -554,8 +560,6 @@ class SciDataProcessor:
             'qref':             qref_out,
             'irfl':             irfl_out,
             'qrfl':             qrfl_out,
-            'sweep_time':       np.array(sweep_time,       dtype=np.float64),
-            'sweep_src':        np.array(sweep_src,        dtype=np.uint8),
             'n_freq_per_sweep': n_freq_arr,
             'calc_total_count': np.array(total_count_list, dtype=np.uint16),
         }
@@ -575,6 +579,49 @@ class SciDataProcessor:
                 gc.collect()
 
         return result
+
+    @staticmethod
+    def pt1000_resistance_to_temp(r: float) -> float:
+        """PT1000 CVD 逆公式（Callendar-Van Dusen，适用 T ≥ 0℃）
+
+        T = (-A + sqrt(A²-4B(1-R/R0))) / (2B)
+        电阻超出 [800, 3000] Ω 认为传感器异常，返回 NaN。
+        """
+        if r < 800.0 or r > 3000.0:
+            return np.nan
+        discriminant = PT1000_A * PT1000_A - 4.0 * PT1000_B * (1.0 - r / PT1000_R0)
+        if discriminant < 0.0:
+            return np.nan
+        return (-PT1000_A + np.sqrt(discriminant)) / (2.0 * PT1000_B)
+
+    @staticmethod
+    def process_all_temps(temp_pkts: list) -> np.ndarray:
+        """解码温度包，返回 (n_pkt, 5, 5) float64 温度数组 (℃)
+
+        75 bytes/packet = 5 chips × 5 channels × 3 bytes (offset-binary 24-bit)
+        R  = (code − 2²³) × Vref / (2²³ × PGA × Iio)
+        T  = PT1000 CVD 逆公式
+        无效通道返回 NaN。
+        """
+        n = len(temp_pkts)
+        data = np.full((n, TEMP_N_CHIPS, TEMP_CH_PER_CHIP), np.nan, dtype=np.float64)
+        sci_size = TEMP_N_CHIPS * TEMP_CH_PER_CHIP * 3  # 75 bytes
+
+        scale = TEMP_VREF / ((1 << 23) * TEMP_PGA * TEMP_IIO)
+        offset_code = 1 << 23
+
+        for i, pkt in enumerate(temp_pkts):
+            sd = pkt.sci_data
+            if len(sd) < sci_size:
+                continue
+            for chip in range(TEMP_N_CHIPS):
+                for ch in range(TEMP_CH_PER_CHIP):
+                    byte_idx = (chip * TEMP_CH_PER_CHIP + ch) * 3
+                    code = int.from_bytes(sd[byte_idx:byte_idx + 3], 'big')
+                    r = (code - offset_code) * scale
+                    data[i, chip, ch] = SciDataProcessor.pt1000_resistance_to_temp(r)
+
+        return data
 
 
 class MetadataExtractor:
@@ -689,6 +736,7 @@ class HongMengFileProcessor:
             'time':     np.ndarray (n_pkt,),           # 每包时间戳 float64
             'seq':      np.ndarray (n_pkt,),           # 包序列计数 uint16
             'src':      np.ndarray (n_pkt,),           # 被测源序列号 uint8
+            'obs_seq':  np.ndarray (n_sources,),       # 检测到的观测序列 uint8
             'metadata': {                              # per-packet 包头字段
                 'app_id':         np.ndarray uint16,   #   应用过程标识符
                 'version':        np.ndarray uint8,    #   版本号
@@ -701,10 +749,32 @@ class HongMengFileProcessor:
             },
         }
 
-        result['vna']  = { 'data': {s11, iref, qref, irfl, qrfl,
-                            sweep_time, sweep_src, n_freq_per_sweep, calc_total_count},
-                           'raw', 'time', 'seq', 'src', 'metadata': {...} }
-        result['temp'] = { 'raw', 'time', 'seq', 'src', 'metadata': {...} }
+        result['vna']  = {
+            'data':             (n_sweep, n_freq) complex128,  # S11 线性复数值
+            'raw': {                                           # 原始 IQ 值
+                'iref':         (n_sweep, n_freq) int64,
+                'qref':         (n_sweep, n_freq) int64,
+                'irfl':         (n_sweep, n_freq) int64,
+                'qrfl':         (n_sweep, n_freq) int64,
+            },
+            'time':             (n_pkt,) float64,
+            'seq':              (n_pkt,) uint16,
+            'src':              (n_pkt,) uint8,
+            'obs_seq':          (n_sources,) uint8,
+            'n_freq_per_sweep': (n_sweep,) int32,
+            'metadata': {
+                ... per-packet 包头字段 (同 SPEC) ...,
+                'calc_total_count': (n_sweep,) uint16,
+            },
+        }
+        result['temp'] = {
+            'data':     (n_pkt, 5, 5) float64,  # 解码温度 (℃)，NaN 表示无效通道
+            'raw':      (n_pkt,) object,          # 每包原始 75-byte 科学数据
+            'time':     (n_pkt,) float64,
+            'seq':      (n_pkt,) uint16,
+            'src':      (n_pkt,) uint8,
+            'metadata': {...},
+        }
 
         通过 metadata[field][i] 可快速定位第 i 个包的任意包头字段。
         """
@@ -757,6 +827,7 @@ class HongMengFileProcessor:
                     'time':     primary['time'],
                     'seq':      primary['seq'],
                     'src':      primary['src'],
+                    'obs_seq':  self.detect_obs_sequence(primary['src']),
                     'metadata': metadata,
                 }
 
@@ -765,31 +836,41 @@ class HongMengFileProcessor:
         if vna_pkts:
             primary, metadata = self.metadata_extractor.extract_arrays(vna_pkts)
             logger.info(f"VNA: {len(vna_pkts)} packets, processing S parameters...")
-            vna_raw = np.empty(len(vna_pkts), dtype=object)
-            for i, pkt in enumerate(vna_pkts):
-                vna_raw[i] = pkt.sci_data
 
             # 解码 VNA S 参数
-            vna_data = self.sci_processor.process_all_vna(vna_pkts)
+            vna_decoded = self.sci_processor.process_all_vna(vna_pkts)
+
+            # sweep-level 字段移入 metadata
+            metadata['calc_total_count'] = vna_decoded['calc_total_count']
 
             result['vna'] = {
-                'data':     vna_data,       # dict: s11, iref, qref, irfl, qrfl, sweep_time, ...
-                'raw':      vna_raw,
-                'time':     primary['time'],
-                'seq':      primary['seq'],
-                'src':      primary['src'],
-                'metadata': metadata,
+                'data':             vna_decoded['s11'],          # (n_sweep, n_freq) complex128
+                'raw': {                                         # 原始 IQ
+                    'iref': vna_decoded['iref'],
+                    'qref': vna_decoded['qref'],
+                    'irfl': vna_decoded['irfl'],
+                    'qrfl': vna_decoded['qrfl'],
+                },
+                'time':             primary['time'],             # (n_pkt,) float64
+                'seq':              primary['seq'],              # (n_pkt,) uint16
+                'src':              primary['src'],              # (n_pkt,) uint8
+                'obs_seq':          self.detect_obs_sequence(primary['src']),  # (n_sources,) uint8
+                'n_freq_per_sweep': vna_decoded['n_freq_per_sweep'],  # (n_sweep,) int32
+                'metadata':         metadata,
             }
 
         # ---------- 2c. 温度数据（TEMP）----------
         temp_pkts = separated.get('TEMP', [])
         if temp_pkts:
             primary, metadata = self.metadata_extractor.extract_arrays(temp_pkts)
-            logger.info(f"TEMP: {len(temp_pkts)} packets")
+            logger.info(f"TEMP: {len(temp_pkts)} packets, decoding temperatures...")
             temp_raw = np.empty(len(temp_pkts), dtype=object)
             for i, pkt in enumerate(temp_pkts):
                 temp_raw[i] = pkt.sci_data
+            temp_data = self.sci_processor.process_all_temps(temp_pkts)
+            logger.info(f"TEMP data shape: {temp_data.shape}")
             result['temp'] = {
+                'data':     temp_data,
                 'raw':      temp_raw,
                 'time':     primary['time'],
                 'seq':      primary['seq'],
@@ -836,8 +917,42 @@ class HongMengFileProcessor:
         return aligned, dropped
 
     @staticmethod
+    def detect_obs_sequence(src: np.ndarray) -> np.ndarray:
+        """从 src 数组中检测预设观测序列（源的排列组合）
+
+        算法：RLE 压缩 src 获取连续源转换序列，找到首个重复出现的
+        源值，截取两次出现之间的片段作为一个完整观测周期。
+
+        Parameters
+        ----------
+        src : (n_pkt,) uint8   被测源序列号数组
+
+        Returns
+        -------
+        obs_seq : (n_sources,) uint8   一个观测周期中源序列号（按观测顺序）
+        """
+        if len(src) == 0:
+            return np.array([], dtype=np.uint8)
+
+        # RLE: 连续相同值压缩，只保留转换点
+        changes = np.where(np.diff(src) != 0)[0] + 1
+        run_values = src[np.concatenate([[0], changes])]
+
+        # 在 RLE 序列中找第一个重复出现的值
+        seen: Dict[int, int] = {}
+        for i, v in enumerate(run_values):
+            v_int = int(v)
+            if v_int in seen:
+                return np.array(run_values[seen[v_int]:i], dtype=np.uint8)
+            seen[v_int] = i
+
+        # 未检测到完整周期，返回按出现顺序的去重序列
+        _, idx = np.unique(run_values, return_index=True)
+        return np.array(run_values[np.sort(idx)], dtype=np.uint8)
+
+    @staticmethod
     def _save_result(file_path: Path, result: Dict):
-        """保存结果（展平为 type_field / type_meta_field / type_data_field 格式）"""
+        """保存结果（展平为 type_field / type_meta_field / type_raw_field 格式）"""
         output_path = file_path.parent / f"{file_path.stem}_Parced_v3.npz"
         logger.info(f"Saving to {output_path.name}")
         save_data = {}
@@ -849,11 +964,11 @@ class HongMengFileProcessor:
                     for mf, mv in value.items():
                         if isinstance(mv, (np.ndarray, int, float, str)):
                             save_data[f"{type_key}_meta_{mf}"] = mv
-                elif field == 'data' and isinstance(value, dict):
-                    # VNA data dict: s11, iref, qref, irfl, qrfl, ...
-                    for df, dv in value.items():
-                        if isinstance(dv, (np.ndarray, int, float, str)):
-                            save_data[f"{type_key}_data_{df}"] = dv
+                elif field == 'raw' and isinstance(value, dict):
+                    # VNA raw dict: iref, qref, irfl, qrfl
+                    for rf, rv in value.items():
+                        if isinstance(rv, (np.ndarray, int, float, str)):
+                            save_data[f"{type_key}_raw_{rf}"] = rv
                 elif isinstance(value, (np.ndarray, int, float, str)):
                     save_data[f"{type_key}_{field}"] = value
         np.savez_compressed(output_path, **save_data)
@@ -1019,13 +1134,13 @@ if __name__ == '__main__':
                         print(f"    {mf}: shape={mv.shape}, dtype={mv.dtype}")
                     else:
                         print(f"    {mf}: {mv}")
-            elif field == 'data' and isinstance(value, dict):
-                print(f"  data:")
-                for df, dv in value.items():
-                    if hasattr(dv, 'shape'):
-                        print(f"    {df}: shape={dv.shape}, dtype={dv.dtype}")
+            elif field == 'raw' and isinstance(value, dict):
+                print(f"  raw:")
+                for rf, rv in value.items():
+                    if hasattr(rv, 'shape'):
+                        print(f"    {rf}: shape={rv.shape}, dtype={rv.dtype}")
                     else:
-                        print(f"    {df}: {dv}")
+                        print(f"    {rf}: {rv}")
             elif hasattr(value, 'shape'):
                 print(f"  {field}: shape={value.shape}, dtype={value.dtype}")
             elif isinstance(value, list):

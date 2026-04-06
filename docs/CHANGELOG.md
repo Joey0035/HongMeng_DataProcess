@@ -10,6 +10,12 @@
 ### Changed
 - 将接收机动态范围的计算基准调整为 28MHz 频段。
 
+## [HongMeng_raw_data_Parser 3.3.0] - 2026-04-07
+### Added
+- TEMP 温度解码：offset-binary 24-bit ADC code → PT1000 电阻 → CVD 逆公式 → ℃
+  - 输出 `data` 字段，shape=(n_pkt, 5, 5) float64，chip×channel 组织，NaN 表示异常
+- `obs_seq` 字段（SPEC / VNA）：RLE 检测 src 中的预设观测序列，还原源的排列组合
+
 ## [HongMeng_raw_data_Parser 3.2.0] - 2026-04-03
 ### Added
 - VNA S参数解码：按 group_flag 自动分组扫频，计算 S11 线性复数值及原始 IQ
