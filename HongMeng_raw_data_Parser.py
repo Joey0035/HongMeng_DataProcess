@@ -51,6 +51,10 @@ SCI_DATA_SIZES = {
     'TEMP': 75,
 }
 
+# 包数据域长度上限（用于过滤伪同步码导致的荒谬 data_len）
+# 最大合法包 = VNA: OVERHEAD(14) + 2404 = 2418; 留 2x 余量
+MAX_DATA_LEN = 8192
+
 PACKETS_PER_SPEC = 64
 CHANNELS_PER_SPEC = 4
 VALUES_PER_CHANNEL = 4096
@@ -66,7 +70,7 @@ VNA_MAX_FREQ_PER_PKT = 100   # 每包最多 100 个频点
 TEMP_N_CHIPS     = 5           # AD7124 芯片数
 TEMP_CH_PER_CHIP = 5           # 每芯片通道数
 TEMP_VREF        = 2.5         # 参考电压 (V)
-TEMP_PGA         = 1           # 增益
+TEMP_PGA         = 2           # 增益
 TEMP_IIO         = 0.0005      # 激励电流 (A)
 PT1000_A         = 3.9083e-3   # Callendar-Van Dusen 系数 A
 PT1000_B         = -5.775e-7   # Callendar-Van Dusen 系数 B
@@ -213,6 +217,17 @@ class PacketParser:
 
             # 识别包数据类型
             pkt_data_type = APP_ID_MAP.get(app_id, 'UNKNOWN')
+
+            # valid_data_len 与类型预期值不匹配时标记异常（仍保留此包）
+            expected_n = SCI_DATA_SIZES.get(pkt_data_type)
+            if expected_n is not None and valid_data_len != expected_n:
+                # VNA 包的 valid_data_len 因频点数不同本来就不固定，不做此检查
+                if pkt_data_type != 'VNA':
+                    if self.log_errors and self.error_count <= 10:
+                        logger.warning(
+                            f"{pkt_data_type} valid_data_len={valid_data_len}, "
+                            f"expected={expected_n} (seq={seq_count})")
+
             self.type_counts[pkt_data_type] = self.type_counts.get(pkt_data_type, 0) + 1
             self.packet_count += 1
 
@@ -308,10 +323,12 @@ class PacketParser:
 
         # 处理剩余缓冲区
         if buf:
-            packets_chunk, _, _ = self._extract_packets_from_buffer(
+            packets_chunk, remaining, _ = self._extract_packets_from_buffer(
                 buf, base_offset=buf_file_offset
             )
             packets.extend(packets_chunk)
+            if remaining and remaining is not buf:
+                self._log_trailing(remaining, base_offset=buf_file_offset + len(buf) - len(remaining))
 
         logger.info(f"Parsing complete: {len(packets)} packets, "
                    f"{self.error_count} errors")
@@ -337,12 +354,25 @@ class PacketParser:
         mv = memoryview(buf)
         offset = 0
         buf_len = len(buf)
+        first_sync_found = False
 
         while offset + PACKET_HEADER_SIZE <= buf_len:
             # 查找同步码
             if mv[offset:offset + 2] != SYNC_WORD:
                 offset += 1
                 continue
+
+            # 记录首次同步码前跳过的字节（不完整的头部数据）
+            if not first_sync_found:
+                first_sync_found = True
+                if offset > 0:
+                    logger.info(f"Skipped {offset} leading bytes before first sync at offset 0x{base_offset + offset:08X}")
+                    self.dropped_records.append({
+                        'reason':      'leading_incomplete_data',
+                        'file_offset': base_offset,
+                        'total_len':   offset,
+                        'raw_hex':     bytes(mv[:min(offset, 64)]).hex() + ('...' if offset > 64 else ''),
+                    })
 
             start = offset
             try:
@@ -354,6 +384,11 @@ class PacketParser:
                 data_len_raw = int.from_bytes(mv[offset:offset + 3], "big")
                 data_len = data_len_raw + 1  # 包数据域字节数（含时间+src_num+valid_len+科学数据+校验和）
                 offset += 3
+
+                # 防御伪同步码：data_len 过大或过小→跳过此 sync，从 start+1 继续扫描
+                if data_len < PACKET_DATA_DOMAIN_OVERHEAD or data_len > MAX_DATA_LEN:
+                    offset = start + 1
+                    continue
 
                 # total_len = 主导头(9) + 包数据域(data_len)
                 # data_len 已包含时间码、有效数据及校验和，无需再加 PACKET_CHECKSUM_SIZE
@@ -383,9 +418,25 @@ class PacketParser:
         remaining_buf = buf[offset:] if offset > 0 else buf
         return packets, remaining_buf, consumed
 
+    def _log_trailing(self, remaining: bytes, base_offset: int):
+        """记录尾部不完整数据"""
+        trail_len = len(remaining)
+        if trail_len == 0:
+            return
+        logger.info(f"Trailing {trail_len} bytes at offset 0x{base_offset:08X} "
+                     f"(incomplete packet at end, discarded)")
+        self.dropped_records.append({
+            'reason':      'trailing_incomplete_data',
+            'file_offset': base_offset,
+            'total_len':   trail_len,
+            'raw_hex':     remaining[:min(trail_len, 64)].hex() + ('...' if trail_len > 64 else ''),
+        })
+
     def parse_packets_all_in_memory(self, buf: bytes) -> list:
         """整读模式（小文件）"""
-        packets, _, _ = self._extract_packets_from_buffer(buf, base_offset=0)
+        packets, remaining, _ = self._extract_packets_from_buffer(buf, base_offset=0)
+        if remaining and remaining is not buf:
+            self._log_trailing(remaining, base_offset=len(buf) - len(remaining))
         return packets
 
 # %%
@@ -886,6 +937,12 @@ class HongMengFileProcessor:
         if save:
             self._save_result(file_path, result)
 
+        # 异常检测
+        anomalies = self._detect_anomalies(result)
+        if anomalies:
+            total_items = sum(len(v) for v in anomalies.values())
+            logger.warning(f"Data anomalies detected: {total_items} issues in {len(anomalies)} categories")
+
         # 写解包日志（始终生成）
         log_path = (file_path.parent / f"{file_path.stem}_parse.log")
         self._write_parse_log(
@@ -897,6 +954,7 @@ class HongMengFileProcessor:
             spec_aligned_count=len(aligned) if spec_pkts else 0,
             align_dropped=align_dropped,
             unk_pkts=unk_pkts,
+            anomalies=anomalies,
         )
 
         logger.info("Processing complete!")
@@ -951,6 +1009,102 @@ class HongMengFileProcessor:
         return np.array(run_values[np.sort(idx)], dtype=np.uint8)
 
     @staticmethod
+    def _detect_anomalies(result: Dict) -> Dict[str, List[str]]:
+        """对已解包的数据执行异常检测
+
+        检测项：
+        1. 时间戳异常：时间=0、时间回跳（非单调递增）
+        2. seq_count 间隙：相邻包序号不连续（考虑 14-bit 回绕）
+        3. VNA 不完整扫频：首扫缺 group_flag==1 起始，尾扫频点数异常
+        4. TEMP 全 NaN 行：某包全部通道无效
+
+        Returns
+        -------
+        dict : {category: [description_strings]}
+        """
+        anomalies: Dict[str, List[str]] = {}
+
+        def add(cat: str, msg: str):
+            anomalies.setdefault(cat, []).append(msg)
+
+        for key in ('spec', 'vna', 'temp'):
+            if key not in result:
+                continue
+            sub = result[key]
+            t = sub['time']
+            seq = sub['seq']
+            n = len(t)
+            label = key.upper()
+
+            # --- 时间戳异常 ---
+            zero_mask = t == 0
+            n_zero = int(zero_mask.sum())
+            if n_zero > 0:
+                add('timestamp', f"{label}: {n_zero} packets with timestamp=0")
+
+            if n > 1:
+                dt = np.diff(t)
+                backwards = np.where(dt < 0)[0]
+                if len(backwards) > 0:
+                    add('timestamp',
+                        f"{label}: {len(backwards)} time-backwards jumps "
+                        f"(first at pkt #{int(backwards[0])}→#{int(backwards[0])+1}, "
+                        f"Δt={dt[backwards[0]]:.6f}s)")
+
+            # --- seq_count 间隙 ---
+            if n > 1:
+                expected_diff = np.ones(n - 1, dtype=np.int32)
+                actual_diff = np.diff(seq.astype(np.int32))
+                # 14-bit 回绕：0x3FFF → 0 的跳变 = -16383，等价于 +1
+                actual_diff_wrapped = np.where(actual_diff == -16383, 1, actual_diff)
+                gaps = np.where(actual_diff_wrapped != expected_diff)[0]
+                if len(gaps) > 0:
+                    total_missed = int(np.abs(actual_diff_wrapped[gaps] - 1).sum())
+                    add('seq_gap',
+                        f"{label}: {len(gaps)} seq_count discontinuities, "
+                        f"~{total_missed} packets likely lost "
+                        f"(first gap at pkt #{int(gaps[0])}: "
+                        f"seq {int(seq[gaps[0]])}→{int(seq[gaps[0]+1])})")
+
+        # --- VNA 不完整扫频 ---
+        if 'vna' in result:
+            vna = result['vna']
+            nf = vna.get('n_freq_per_sweep')
+            if nf is not None and len(nf) > 1:
+                # 频点数分组（设备可能有多组配置，如 901 和 1901，属正常）
+                vals, counts = np.unique(nf, return_counts=True)
+                # 每组内的扫频应频点数一致；只标记出现次数=1的孤立扫频（很可能截断）
+                singleton_sweeps = []
+                for v, c in zip(vals, counts):
+                    if c == 1:
+                        idx = int(np.where(nf == v)[0][0])
+                        singleton_sweeps.append((idx, int(v)))
+                if singleton_sweeps:
+                    details = ', '.join(f"sweep#{i}={n}pts" for i, n in singleton_sweeps[:5])
+                    add('vna_sweep',
+                        f"VNA: {len(singleton_sweeps)} singleton-frequency sweeps "
+                        f"(likely truncated): {details}")
+                # 报告频点分组概况
+                if len(vals) > 1:
+                    group_str = ', '.join(f"{int(v)}pts×{int(c)}" for v, c in zip(vals, counts))
+                    add('vna_sweep', f"VNA freq groups: {group_str}")
+
+            gf = vna['metadata']['group_flag']
+            if len(gf) > 0 and gf[0] != 1:
+                add('vna_sweep', "VNA: first packet missing group_flag=1 (incomplete leading sweep)")
+
+        # --- TEMP 全 NaN ---
+        if 'temp' in result:
+            td = result['temp']['data']
+            nan_rows = np.where(np.all(np.isnan(td.reshape(td.shape[0], -1)), axis=1))[0]
+            if len(nan_rows) > 0:
+                add('temp_nan',
+                    f"TEMP: {len(nan_rows)} packets with all-NaN temperature "
+                    f"(indices: {list(nan_rows[:10])}{'...' if len(nan_rows) > 10 else ''})")
+
+        return anomalies
+
+    @staticmethod
     def _save_result(file_path: Path, result: Dict):
         """保存结果（展平为 type_field / type_meta_field / type_raw_field 格式）"""
         output_path = file_path.parent / f"{file_path.stem}_Parced_v3.npz"
@@ -984,6 +1138,7 @@ class HongMengFileProcessor:
         spec_aligned_count: int,
         align_dropped: list,
         unk_pkts: list,
+        anomalies: Optional[Dict[str, List[str]]] = None,
     ):
         """写解包日志文件"""
         parser = self.parser
@@ -1085,6 +1240,20 @@ class HongMengFileProcessor:
                 for j in range(0, len(hex_str), 64):
                     w(f"  {hex_str[j:j+64]}")
                 w("")
+
+        # --- 7. 数据异常检测结果 ---
+        if anomalies is None:
+            anomalies = {}
+        total_anomaly_items = sum(len(v) for v in anomalies.values())
+        w(f"[Data Anomalies]  (total: {total_anomaly_items} issues)")
+        if not anomalies:
+            w("  (none — all checks passed)")
+        else:
+            for cat, msgs in anomalies.items():
+                w(f"  [{cat}]")
+                for msg in msgs:
+                    w(f"    - {msg}")
+        w("")
 
         w(f"{'='*70}")
         w(f"  END OF LOG")
