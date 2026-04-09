@@ -82,8 +82,8 @@ class DataInspector:
     _SPEC_BW_MHZ  = 250.0
     _SPEC_N_CH    = 4096
     _DTYPE_LABEL  = {
-        '1': 'Auto-A', '2': 'Auto-B',
-        'r': 'Cross-Imag', 'i': 'Cross-Real',
+        '1': 'Auto1', '2': 'Auto2',
+        'r': 'Cross-Real', 'i': 'Cross-Imag',
     }
 
     def __init__(self, data_parsed: dict, vna_freq: Optional[Dict[int, Tuple[float, float]]] = None):
@@ -113,8 +113,8 @@ class DataInspector:
 
     @staticmethod
     def _ri12_map(dtype: str) -> int:
-        """'1'->0 (Auto-A), '2'->1 (Auto-B), 'r'->2 (Cross-Imag), 'i'->3 (Cross-Real)"""
-        m = {'1': 0, '2': 1, 'r': 2, 'i': 3}
+        """'1'->0 (Auto1), '2'->1 (Auto2), 'r'->3 (Cross-Real), 'i'->2 (Cross-Imag)"""
+        m = {'1': 0, '2': 1, 'r': 3, 'i': 2}
         if dtype not in m:
             raise ValueError(f"dtype must be '1','2','r','i', got '{dtype}'")
         return m[dtype]

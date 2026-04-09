@@ -10,6 +10,26 @@
 ### Changed
 - 将接收机动态范围的计算基准调整为 28MHz 频段。
 
+## [HongMeng_raw_data_Parser 3.4.0] - 2026-04-08
+### Added
+- 不完整包处理：文件头 / 尾截断数据自动识别并跳过，记录到 `_parse.log`
+- 伪同步码防御：`MAX_DATA_LEN` 上限检查，防止 `0xEB90` 出现在科学数据中时误触发大内存分配
+- `valid_data_len` 校验：SPEC/TEMP 有效数据长度偏离标准值时发出 WARNING
+- 数据异常检测 `_detect_anomalies()`：
+  - 时间戳异常（timestamp=0、时间回跳）
+  - seq_count 间隙（丢包检测，含 14-bit 回绕处理）
+  - VNA 不完整扫频（孤立频点数、首包缺 group_flag=1）
+  - TEMP 全 NaN 行（整包无效通道）
+- 解包日志新增 `[Data Anomalies]` 段，汇总所有异常检测结果
+- `HongMeng_DataInspector.py`：从 notebook 中提取 `EffectiveDataExtractor` 和 `DataInspector` 类
+  - `plot_vna_panel()` 支持 VNA S11 面板（first sweep / mean / waterfall，MHz x-axis，dB y-axis）
+  - SPEC 和 VNA 频率轴统一使用 MHz，纵轴统一使用 dB
+- 新增文档 `docs/异常数据处理说明.md`
+
+### Changed
+- DataInspector dtype 标签重命名：`'1'→Auto1, '2'→Auto2, 'r'→Cross-Real, 'i'→Cross-Imag`
+- SPEC data 通道说明统一为：`[i,0,:]=Auto1, [i,1,:]=Auto2, [i,2,:]=Cross-Imag, [i,3,:]=Cross-Real`
+
 ## [HongMeng_raw_data_Parser 3.3.0] - 2026-04-07
 ### Added
 - TEMP 温度解码：offset-binary 24-bit ADC code → PT1000 电阻 → CVD 逆公式 → ℃

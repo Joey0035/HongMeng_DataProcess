@@ -1,0 +1,171 @@
+"""
+Page 2: Temperature Monitoring
+"""
+
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+from datetime import datetime
+
+import data_manager
+import data_processor as dp
+import plot_utils
+from config import TEMP_SENSOR_LABELS, TEMP_N_CHIPS, TEMP_CH_PER_CHIP
+from theme import apply_theme
+
+apply_theme()
+
+st.title("Temperature Monitoring")
+
+if not data_manager.is_data_loaded():
+    st.warning("No data loaded. Please upload a file from the main page.")
+    st.stop()
+
+result = data_manager.get_result()
+if 'temp' not in result:
+    st.warning("No temperature data in this file.")
+    st.stop()
+
+temp = result['temp']
+temp_data = temp['data']   # (n_pkt, 5, 5)
+time_arr = temp['time']    # (n_pkt,)
+
+thresholds = st.session_state.get('temp_thresholds', {'high': 60.0, 'low': -10.0})
+
+# ==============================================================
+#  Controls
+# ==============================================================
+
+# Time range
+t_min_dt = datetime.fromtimestamp(float(time_arr[0]))
+t_max_dt = datetime.fromtimestamp(float(time_arr[-1]))
+time_range = st.slider(
+    "Time Range",
+    min_value=t_min_dt,
+    max_value=t_max_dt,
+    value=(t_min_dt, t_max_dt),
+    format="HH:mm:ss",
+)
+
+t_start = time_range[0].timestamp()
+t_end = time_range[1].timestamp()
+
+# --- Sensor selection: checkbox grid by chip ---
+st.markdown("**Sensor Selection**")
+btn_col1, btn_col2, _ = st.columns([1, 1, 6])
+with btn_col1:
+    select_all = st.button("Select All", key="temp_sel_all", use_container_width=True)
+with btn_col2:
+    deselect_all = st.button("Deselect All", key="temp_desel_all", use_container_width=True)
+
+if select_all:
+    st.session_state['temp_src_state'] = {lbl: True for lbl in TEMP_SENSOR_LABELS}
+if deselect_all:
+    st.session_state['temp_src_state'] = {lbl: False for lbl in TEMP_SENSOR_LABELS}
+
+if 'temp_src_state' not in st.session_state:
+    st.session_state['temp_src_state'] = {lbl: True for lbl in TEMP_SENSOR_LABELS}
+
+# Display as 5 columns (one per channel), 5 rows (one per chip)
+grid_cols = st.columns(TEMP_CH_PER_CHIP)
+for i in range(TEMP_N_CHIPS):
+    for j in range(TEMP_CH_PER_CHIP):
+        lbl = f"Chip{i}-Ch{j}"
+        with grid_cols[j]:
+            st.session_state['temp_src_state'][lbl] = st.checkbox(
+                lbl, value=st.session_state['temp_src_state'].get(lbl, True),
+                key=f"temp_cb_{lbl}",
+            )
+
+selected_labels = [lbl for lbl in TEMP_SENSOR_LABELS if st.session_state['temp_src_state'].get(lbl, False)]
+
+# Convert labels to indices
+selected_indices = [dp.label_to_chip_ch(lbl) for lbl in selected_labels]
+
+# ==============================================================
+#  Statistics panel
+# ==============================================================
+
+stats = dp.compute_temp_statistics(temp_data, time_arr, selected_indices, t_start, t_end)
+
+st.subheader("Statistics")
+stat_cols = st.columns(4)
+with stat_cols[0]:
+    st.metric("Global Max", f"{stats['global_max']:.1f} °C")
+with stat_cols[1]:
+    st.metric("Global Min", f"{stats['global_min']:.1f} °C")
+with stat_cols[2]:
+    if selected_indices:
+        avg_fluct = np.nanmean([v['fluctuation'] for v in stats['per_point'].values()])
+        st.metric("Avg Fluctuation", f"{avg_fluct:.2f} °C")
+    else:
+        st.metric("Avg Fluctuation", "N/A")
+with stat_cols[3]:
+    if selected_indices:
+        avg_mean = np.nanmean([v['mean'] for v in stats['per_point'].values()])
+        st.metric("Avg Temperature", f"{avg_mean:.1f} °C")
+    else:
+        st.metric("Avg Temperature", "N/A")
+
+# ==============================================================
+#  Anomaly alerts
+# ==============================================================
+
+alerts = []
+for chip, ch in selected_indices:
+    label = f"Chip{chip}-Ch{ch}"
+    pdata = stats['per_point'].get(label, {})
+    if not pdata:
+        continue
+    if pdata['max'] > thresholds['high']:
+        alerts.append((label, 'high', pdata['max']))
+    if pdata['min'] < thresholds['low']:
+        alerts.append((label, 'low', pdata['min']))
+
+if alerts:
+    st.subheader("Alerts")
+    for label, kind, val in alerts:
+        if kind == 'high':
+            st.error(f"**{label}**: Max temp {val:.1f}°C exceeds threshold {thresholds['high']}°C")
+        else:
+            st.warning(f"**{label}**: Min temp {val:.1f}°C below threshold {thresholds['low']}°C")
+
+# ==============================================================
+#  Temperature time series chart
+# ==============================================================
+
+if selected_labels:
+    # Filter by time range
+    mask = (time_arr >= t_start) & (time_arr <= t_end)
+    filtered_data = temp_data[mask]
+    filtered_time = time_arr[mask]
+
+    selected_points = [(chip, ch, f"Chip{chip}-Ch{ch}")
+                       for chip, ch in selected_indices]
+
+    fig = plot_utils.create_temp_timeseries(
+        filtered_data, filtered_time, selected_points, thresholds
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+# ==============================================================
+#  Per-sensor statistics table
+# ==============================================================
+
+if selected_indices:
+    st.subheader("Per-Sensor Statistics")
+    rows = []
+    for label, pdata in stats['per_point'].items():
+        rows.append({
+            'Sensor': label,
+            'Max (°C)': f"{pdata['max']:.2f}",
+            'Min (°C)': f"{pdata['min']:.2f}",
+            'Fluctuation (°C)': f"{pdata['fluctuation']:.2f}",
+            'Mean (°C)': f"{pdata['mean']:.2f}",
+        })
+    df = pd.DataFrame(rows)
+    st.dataframe(df, use_container_width=True, hide_index=True)

@@ -1,6 +1,6 @@
 ================================================================================
   HongMeng Raw Data Parser — result 数据层级结构文档
-  Generated: 2026-04-07
+  Generated: 2026-04-08
 ================================================================================
 
 result = process_file(file_path) 返回一个 dict，按数据类型分为三个顶层 key：
@@ -23,10 +23,10 @@ result = process_file(file_path) 返回一个 dict，按数据类型分为三个
   键                    形状                      类型          说明
   ────────────────────  ────────────────────────  ──────────  ──────────────────────────────
   data                  (n_fft, 4, 4096)          int64       解码后科学数据
-                                                               [i, 0, :] = A路自相关
-                                                               [i, 1, :] = B路自相关
-                                                               [i, 2, :] = 互相关虚部
-                                                               [i, 3, :] = 互相关实部
+                                                               [i, 0, :] = Auto1
+                                                               [i, 1, :] = Auto2
+                                                               [i, 2, :] = Cross-Imag (互相关虚部)
+                                                               [i, 3, :] = Cross-Real (互相关实部)
   raw                   (n_pkt,)                  object      每包原始科学数据 (bytes)
   time                  (n_pkt,)                  float64     每包时间戳 (秒+微秒)
   seq                   (n_pkt,)                  uint16      包序列计数
@@ -51,7 +51,7 @@ result = process_file(file_path) 返回一个 dict，按数据类型分为三个
   使用示例：
     spec = result["spec"]
     fft_0 = spec["data"][0]              # 第 0 次 FFT, shape=(4, 4096)
-    auto_A = fft_0[0]                    # A路自相关, shape=(4096,)
+    auto_1 = fft_0[0]                   # Auto1, shape=(4096,)
     t0 = spec["time"][0]                 # 第 0 包的时间戳
     spec["obs_seq"]                      # 观测序列，如 [30,31,...,45,23]
     spec["metadata"]["app_id"][100]      # 第 100 包的 app_id
@@ -184,6 +184,21 @@ result = process_file(file_path) 返回一个 dict，按数据类型分为三个
   n_freq_..   —                       (n_sweep,) int32         —
   metadata    per-packet 包头(8项)    per-packet(8项)          per-packet(8项)
                                       + calc_total_count
+
+================================================================================
+  解包日志 (_parse.log) 中的 [Data Anomalies] 段
+================================================================================
+
+  v3.4 新增。在解包完成后对 result 执行异常检测，结果写入日志末尾。
+  检测类别：
+
+    timestamp     时间戳=0 / 时间回跳（非单调递增）
+    seq_gap       seq_count 不连续（丢包），含 14-bit 回绕处理
+    vna_sweep     VNA 不完整扫频（孤立频点数 / 首包缺 group_flag=1 / 频点分组）
+    temp_nan      TEMP 某包全部 25 通道解码后全 NaN
+
+  无异常时显示: (none — all checks passed)
+
 
 ================================================================================
   END

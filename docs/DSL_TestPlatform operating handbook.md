@@ -4,9 +4,9 @@
 
 `HongMeng_raw_data_Parser.py` 用于解析 DSL FPGA 数据采集系统原始 `.dat` 文件，支持三种数据类型的解包与处理。
 
-**版本**: v3.3
+**版本**: v3.4
 **作者**: JoeyXu
-**日期**: 2026-04-07
+**日期**: 2026-04-08
 
 ---
 
@@ -18,6 +18,9 @@
 - **观测序列还原**：从 src 中自动检测预设观测序列（源的排列组合），输出 obs_seq
 - **流式分块读取**：自动选择整读或分块模式（默认阈值 512MB）
 - **解包日志**：每次解包自动生成 `_parse.log`，记录丢弃包详情和 hex 原始数据
+- **不完整包自动剔除**：文件头 / 尾截断的不完整数据包自动识别、跳过并记录
+- **伪同步码防御**：科学数据中出现 `0xEB90` 时通过 `data_len` 上限检查快速跳过
+- **数据异常自动检测**：时间戳异常、seq_count 丢包、VNA 不完整扫频、TEMP 全 NaN 通道
 - **Checksum 校验**：逐包验证，错误包自动丢弃并记录
 - **ndarray 统一封装**：所有输出数据均为 numpy 数组
 
@@ -47,7 +50,7 @@ result = processor.process_file('your_data.dat', save=True)
 # SPEC 数据
 spec = result['spec']
 fft_data = spec['data']          # (n_fft, 4, 4096) int64
-auto_A = fft_data[0, 0, :]      # 第 0 次 FFT 的 A 路自相关
+auto_1 = fft_data[0, 0, :]      # 第 0 次 FFT 的 Auto1
 
 # VNA S参数
 vna = result['vna']
@@ -110,8 +113,8 @@ result
 ```
 spec
 ├── data              (n_fft, 4, 4096)  int64     解码后科学数据
-│                      [i,0,:]=A自相关  [i,1,:]=B自相关
-│                      [i,2,:]=互相关虚部  [i,3,:]=互相关实部
+│                      [i,0,:]=Auto1  [i,1,:]=Auto2
+│                      [i,2,:]=Cross-Imag  [i,3,:]=Cross-Real
 ├── raw               (n_pkt,)          object    每包原始科学数据 bytes
 ├── time              (n_pkt,)          float64   时间戳
 ├── seq               (n_pkt,)          uint16    包序列计数
@@ -260,9 +263,29 @@ SPEC 每 64 包组成一次 FFT，尾部不足 64 包的被丢弃。丢弃包记
 ### VNA S11 形状是 object 而非 2D
 各扫频频点数不一致时自动退化为 object 数组，每个元素为 1D ndarray。
 
+### 日志报告 "Data anomalies detected"
+查看 `_parse.log` 末尾 `[Data Anomalies]` 段。常见异常含义：
+- `timestamp`: 时间戳为 0 或时间回跳 → 可能是设备启动阶段或时钟重置
+- `seq_gap`: seq_count 不连续 → 传输过程中有丢包
+- `vna_sweep`: 不完整扫频或多种频点配置 → 文件头/尾截断或多配置混采
+- `temp_nan`: 温度全 NaN → 传感器异常或未接入
+
+### 文件头尾有不完整数据怎么办
+无需处理，解析器自动跳过。跳过的字节数和位置记录在 `_parse.log` 的 `[Dropped Packets Detail]` 段中
+（reason 为 `leading_incomplete_data` 或 `trailing_incomplete_data`）。
+
 ---
 
 ## 版本历史
+
+### v3.4 (2026-04-08)
+- 新增不完整包处理：文件头 / 尾截断数据自动跳过，位置记入 parse.log
+- 新增伪同步码防御：`MAX_DATA_LEN` 上限检查，防止科学数据中的 `0xEB90` 误触发解析
+- 新增 `valid_data_len` 校验：非 VNA 类型有效数据长度偏离标准值时发出 WARNING
+- 新增 `_detect_anomalies()` 数据异常检测（时间戳/丢包/VNA扫频/TEMP全NaN）
+- parse.log 新增 `[Data Anomalies]` 段
+- `HongMeng_DataInspector.py`：DataInspector 从 notebook 中独立为 .py 模块
+- 新增文档 `docs/异常数据处理说明.md`
 
 ### v3.3 (2026-04-07)
 - 新增 TEMP 温度解码：offset-binary 24-bit → PT1000 CVD → (n_pkt, 5, 5) float64
@@ -292,4 +315,4 @@ SPEC 每 64 包组成一次 FFT，尾部不足 64 包的被丢弃。丢弃包记
 
 ---
 
-**最后更新**: 2026-04-07
+**最后更新**: 2026-04-08
