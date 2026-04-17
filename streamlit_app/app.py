@@ -116,7 +116,7 @@ with st.sidebar:
 #  Main area
 # ==============================================================
 
-st.title("HONGMENG RADIO TELESCOPE")
+st.title("HONGMENG HIGH-FREQ SA")
 
 if not data_manager.is_data_loaded():
     _is_dark = st.session_state['theme'] == 'dark'
