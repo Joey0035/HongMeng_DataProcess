@@ -5,6 +5,7 @@ All functions return plotly.graph_objects.Figure instances.
 
 import numpy as np
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from datetime import datetime
 
 
@@ -367,6 +368,181 @@ def create_temp_timeseries(temp_data: np.ndarray, time_arr: np.ndarray,
         title='Temperature Monitor', xaxis_title='Time',
         yaxis_title='Temperature (°C)', height=520))
     return fig
+
+
+# ==============================================================
+#  Waterfall array (multi-source grid)
+# ==============================================================
+
+def _apply_freq_slice(data_2d: np.ndarray, freq_mhz: np.ndarray,
+                      freq_range: tuple = None) -> tuple:
+    """Pre-slice data and freq axis by freq_range. Returns (sliced_data, sliced_freq)."""
+    if freq_range is not None and freq_mhz is not None:
+        f_mask = (freq_mhz >= freq_range[0]) & (freq_mhz <= freq_range[1])
+        return data_2d[:, f_mask], freq_mhz[f_mask]
+    return data_2d, freq_mhz
+
+
+def _style_subplot_fig(fig: go.Figure, title: str, n_rows: int, n_cols: int):
+    """Apply theme styling to a subplot figure."""
+    t = _t()
+    h = max(400, 350 * n_rows)
+    fig.update_layout(
+        height=h,
+        font=_font(), title_font=_title_font(),
+        paper_bgcolor=t['paper'], plot_bgcolor=t['bg'],
+        title=title,
+        margin=dict(l=60, r=60, t=60, b=40),
+    )
+    for ax_key in fig.layout:
+        if ax_key.startswith('xaxis') or ax_key.startswith('yaxis'):
+            fig.layout[ax_key].update(
+                gridcolor=t['grid'],
+                tickfont=dict(size=9, color=t['text']),
+                linecolor=t['axis_line'],
+            )
+    for ann in fig.layout.annotations:
+        ann.font = dict(size=11, color=t['title_color'])
+
+
+def _get_subplot_domains(fig, n_traces: int):
+    """Read actual xaxis/yaxis domains from the figure layout for each trace."""
+    domains = []
+    for i in range(n_traces):
+        ax_suffix = '' if i == 0 else str(i + 1)
+        x_ax = fig.layout[f'xaxis{ax_suffix}']
+        y_ax = fig.layout[f'yaxis{ax_suffix}']
+        xd = x_ax.domain if x_ax.domain else [0, 1]
+        yd = y_ax.domain if y_ax.domain else [0, 1]
+        domains.append((xd, yd))
+    return domains
+
+
+def _build_waterfall_grid(names: list, data_dict: dict, freq_mhz, time_labels_dict: dict,
+                          n_cols: int, freq_range, colorscale, cbar_title: str,
+                          z_func, title: str) -> go.Figure:
+    """Generic grid builder for waterfall arrays.
+
+    Each subplot gets its own independent color axis with a colorbar
+    positioned from the real subplot domain.
+    """
+    n = len(names)
+    if n == 0:
+        return go.Figure()
+    n_rows = (n + n_cols - 1) // n_cols
+    t = _t()
+
+    # Reserve ~7% of the column width for the colorbar gap
+    h_space = 0.12 / max(n_cols - 1, 1) + 0.07
+    v_space = 0.12 / max(n_rows - 1, 1) + 0.06
+
+    fig = make_subplots(
+        rows=n_rows, cols=n_cols,
+        subplot_titles=names,
+        horizontal_spacing=min(h_space, 0.20),
+        vertical_spacing=min(v_space, 0.22),
+    )
+
+    # First pass: add all traces so plotly assigns subplot domains
+    z_arrays = []
+    for i, name in enumerate(names):
+        d = data_dict[name]
+        if isinstance(d, list):
+            d = np.stack(d)
+        d, x = _apply_freq_slice(d, freq_mhz, freq_range)
+        if x is None:
+            x = np.arange(d.shape[1])
+        z = z_func(d)
+        tl = time_labels_dict.get(name, list(range(z.shape[0])))
+        row = i // n_cols + 1
+        col = i % n_cols + 1
+
+        caxis_name = f'coloraxis{i + 1}'
+        fig.add_trace(go.Heatmap(
+            z=z, x=x, y=tl,
+            coloraxis=caxis_name,
+        ), row=row, col=col)
+        z_arrays.append(z)
+
+    # Second pass: read real domains and position colorbars precisely
+    domains = _get_subplot_domains(fig, n)
+    for i, name in enumerate(names):
+        row = i // n_cols + 1
+        col = i % n_cols + 1
+        xd, yd = domains[i]  # ([x0, x1], [y0, y1])
+
+        caxis_name = f'coloraxis{i + 1}'
+        cb_len = (yd[1] - yd[0]) * 0.85
+        cb_x = xd[1] + 0.008          # just to the right of subplot
+        cb_y = (yd[0] + yd[1]) / 2    # vertically centered
+
+        fig.update_layout(**{
+            caxis_name: dict(
+                colorscale=colorscale,
+                colorbar=dict(
+                    tickfont=dict(size=7, color=t['text']),
+                    thickness=6,
+                    len=cb_len,
+                    y=cb_y,
+                    x=cb_x,
+                    xpad=1, ypad=0,
+                    ticks='outside', ticklen=2,
+                    title=dict(text=''),  # no title to save space
+                ),
+            ),
+        })
+
+        # Hide y-tick labels for non-leftmost columns
+        ax_suffix = '' if i == 0 else str(i + 1)
+        if col > 1:
+            fig.layout[f'yaxis{ax_suffix}'].showticklabels = False
+        # Hide x-tick labels for non-bottom rows
+        if row < n_rows:
+            fig.layout[f'xaxis{ax_suffix}'].showticklabels = False
+
+    _style_subplot_fig(fig, title, n_rows, n_cols)
+    return fig
+
+
+def create_spec_waterfall_array(
+    split_data: dict, freq_mhz: np.ndarray,
+    time_labels_dict: dict, channel_name: str,
+    freq_range: tuple = None, n_cols: int = 3,
+) -> go.Figure:
+    """Create a grid of SPEC waterfall heatmaps, one per source."""
+    t = _t()
+    return _build_waterfall_grid(
+        names=list(split_data.keys()),
+        data_dict=split_data, freq_mhz=freq_mhz,
+        time_labels_dict=time_labels_dict, n_cols=n_cols,
+        freq_range=freq_range, colorscale=t['heatmap_scale'],
+        cbar_title='dB',
+        z_func=lambda d: 10 * np.log10(np.abs(d).astype(float).clip(1e-30)),
+        title=f'Waterfall Array // {channel_name}',
+    )
+
+
+def create_vna_waterfall_array(
+    split_data: dict, freq_mhz: np.ndarray,
+    time_labels_dict: dict, is_phase: bool = False,
+    freq_range: tuple = None, n_cols: int = 3,
+) -> go.Figure:
+    """Create a grid of VNA waterfall heatmaps, one per source."""
+    t = _t()
+    cscale = t['phase_scale'] if is_phase else t['heatmap_scale']
+    cbar_title = 'Phase (°)' if is_phase else '|S11| (dB)'
+    if is_phase:
+        z_func = lambda d: np.angle(d, deg=True)
+    else:
+        z_func = lambda d: 20 * np.log10(np.abs(d).astype(float).clip(1e-30))
+    return _build_waterfall_grid(
+        names=list(split_data.keys()),
+        data_dict=split_data, freq_mhz=freq_mhz,
+        time_labels_dict=time_labels_dict, n_cols=n_cols,
+        freq_range=freq_range, colorscale=cscale,
+        cbar_title=cbar_title, z_func=z_func,
+        title=f'Waterfall Array // {"Phase" if is_phase else "|S11|"}',
+    )
 
 
 # ==============================================================

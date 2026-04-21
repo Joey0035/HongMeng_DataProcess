@@ -64,8 +64,14 @@ with btn_col2:
 
 if select_all:
     st.session_state['temp_src_state'] = {lbl: True for lbl in TEMP_SENSOR_LABELS}
+    for lbl in TEMP_SENSOR_LABELS:
+        st.session_state[f"temp_cb_{lbl}"] = True
+    st.rerun()
 if deselect_all:
     st.session_state['temp_src_state'] = {lbl: False for lbl in TEMP_SENSOR_LABELS}
+    for lbl in TEMP_SENSOR_LABELS:
+        st.session_state[f"temp_cb_{lbl}"] = False
+    st.rerun()
 
 if 'temp_src_state' not in st.session_state:
     st.session_state['temp_src_state'] = {lbl: True for lbl in TEMP_SENSOR_LABELS}

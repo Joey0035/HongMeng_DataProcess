@@ -317,3 +317,67 @@ def downsample_waterfall(data_2d: np.ndarray, time_labels: list,
         return data_2d, time_labels, False
     indices = np.linspace(0, n - 1, max_rows, dtype=int)
     return data_2d[indices], [time_labels[i] for i in indices], True
+
+
+# ==============================================================
+#  VNA Calibration wrapper
+# ==============================================================
+
+def apply_vna_calibration(
+    split_data: dict,
+    freq_mhz: np.ndarray,
+    switch_cal_keys: dict,
+    lna_cal_keys: dict | None = None,
+    cable_length_m: float = 0.06,
+    cable_vf: float = 0.695,
+    cable_loss: float = 0.0,
+    snp_file_path: str | None = None,
+) -> tuple:
+    """Apply VNA OSL calibration to split data.
+
+    Parameters
+    ----------
+    split_data : {src_name: (n_sweep, n_freq) complex}
+    freq_mhz : (n_freq,) frequency in MHz
+    switch_cal_keys : {'open': ..., 'short': ..., 'load': ...}
+    lna_cal_keys : same, or None to skip LNA plane
+    cable_length_m, cable_vf, cable_loss : cable analytical parameters
+    snp_file_path : path to .s1p/.s2p to override analytical cable model
+
+    Returns
+    -------
+    (calibrated_split_data, diagnostics)
+    """
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from HongMeng_VNA_Calibrator import (
+        Keysight85033E, CableOffset, calibrate_vna_data,
+    )
+
+    freq_hz = freq_mhz * 1e6
+
+    cal_standard = Keysight85033E()
+
+    if snp_file_path is not None:
+        cable_offset = CableOffset.from_snp_file(
+            snp_file_path,
+            length_m=cable_length_m,
+            velocity_factor=cable_vf,
+            loss_db_per_m_per_ghz=cable_loss,
+        )
+    else:
+        cable_offset = CableOffset(
+            length_m=cable_length_m,
+            velocity_factor=cable_vf,
+            loss_db_per_m_per_ghz=cable_loss,
+        )
+
+    return calibrate_vna_data(
+        split_data=split_data,
+        freq_hz=freq_hz,
+        switch_cal_keys=switch_cal_keys,
+        lna_cal_keys=lna_cal_keys,
+        cal_standard=cal_standard,
+        cable_offset=cable_offset,
+    )

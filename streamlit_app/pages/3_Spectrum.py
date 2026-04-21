@@ -72,8 +72,14 @@ with btn_col2:
 
 if select_all:
     st.session_state['spec_src_state'] = {name: True for name in src_names}
+    for name in src_names:
+        st.session_state[f"spec_cb_{name}"] = True
+    st.rerun()
 if deselect_all:
     st.session_state['spec_src_state'] = {name: False for name in src_names}
+    for name in src_names:
+        st.session_state[f"spec_cb_{name}"] = False
+    st.rerun()
 
 # Initialize: default all selected
 if 'spec_src_state' not in st.session_state:
@@ -102,7 +108,7 @@ filtered_time = {k: v for k, v in split_time.items() if k in selected_sources}
 #  Tabs
 # ==============================================================
 
-tab1, tab2 = st.tabs(["1D Spectrum", "Waterfall"])
+tab1, tab2, tab3 = st.tabs(["1D Spectrum", "Waterfall", "Waterfall Array"])
 
 with tab1:
     if filtered_split:
@@ -142,3 +148,62 @@ with tab2:
                 st.info("No data in the selected time range.")
     else:
         st.info("No sources available.")
+
+with tab3:
+    if filtered_split:
+        freq_min_val, freq_max_val = float(freq_mhz[0]), float(freq_mhz[-1])
+        ctrl1, ctrl2, ctrl3 = st.columns([3, 1, 1])
+        with ctrl1:
+            spec_fr = st.slider(
+                "Frequency Range (MHz)", min_value=freq_min_val, max_value=freq_max_val,
+                value=(freq_min_val, freq_max_val), key="spec_wf_array_freq",
+            )
+        with ctrl2:
+            n_grid_cols = st.select_slider("Columns", options=[2, 3, 4, 5, 6], value=3,
+                                           key="spec_wf_array_cols")
+        with ctrl3:
+            per_page = st.select_slider("Sources/Page", options=[4, 6, 8, 12, 16], value=6,
+                                        key="spec_wf_array_per_page")
+
+        # Prepare data: time-filter + channel select + downsample per source
+        wf_array_data = {}
+        wf_array_times = {}
+        for name in selected_sources:
+            if name not in split_data:
+                continue
+            d = split_data[name]
+            t_arr = split_time[name]
+            mask = (t_arr >= t_start) & (t_arr <= t_end)
+            d_f = d[mask]
+            t_f = t_arr[mask]
+            if len(d_f) == 0:
+                continue
+            # Extract channel first, then downsample (more aggressive for array)
+            wf_d = d_f[:, channel_idx, :]
+            tl = dp.timestamps_to_datetime_strings(t_f)
+            wf_d, tl, _ = dp.downsample_waterfall(wf_d, tl, max_rows=200)
+            wf_array_data[name] = wf_d
+            wf_array_times[name] = tl
+
+        if wf_array_data:
+            all_names = list(wf_array_data.keys())
+            n_pages = max(1, (len(all_names) + per_page - 1) // per_page)
+            page = 0
+            if n_pages > 1:
+                page = st.number_input(
+                    f"Page (1-{n_pages})", min_value=1, max_value=n_pages,
+                    value=1, key="spec_wf_array_page") - 1
+                st.caption(f"Showing sources {page * per_page + 1}–{min((page + 1) * per_page, len(all_names))} of {len(all_names)}")
+            page_names = all_names[page * per_page : (page + 1) * per_page]
+            page_data = {k: wf_array_data[k] for k in page_names}
+            page_times = {k: wf_array_times[k] for k in page_names}
+
+            fig_arr = plot_utils.create_spec_waterfall_array(
+                page_data, freq_mhz, page_times, channel_name,
+                freq_range=spec_fr, n_cols=n_grid_cols,
+            )
+            st.plotly_chart(fig_arr, use_container_width=True)
+        else:
+            st.info("No data in the selected time range.")
+    else:
+        st.info("Select at least one source.")

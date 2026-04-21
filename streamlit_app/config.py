@@ -73,6 +73,31 @@ MAX_WATERFALL_ROWS = 500    # max time steps in waterfall heatmap
 MAX_1D_POINTS = 4096        # max freq points per 1D trace (no effect for SPEC)
 
 # ==============================================================
+#  VNA Calibration
+# ==============================================================
+
+# 12-port switch plane calibration standard source keys
+CAL_SWITCH_PLANE = {
+    'open':  'V_Cal_O_H',   # src 7
+    'short': 'V_Cal_S_H',   # src 8
+    'load':  'V_Cal_L_H',   # src 6
+}
+
+# LNA plane calibration standard source keys
+CAL_LNA_PLANE = {
+    'open':  'V_LNA_O_H',   # src 21
+    'short': 'V_LNA_S_H',   # src 22
+    'load':  'V_LNA_L_H',   # src 23
+}
+
+# LNA plane cable offset defaults (6cm RF cable)
+CAL_LNA_CABLE_DEFAULTS = {
+    'length_m': 0.06,
+    'velocity_factor': 0.695,
+    'loss_db_per_m_per_ghz': 0.0,
+}
+
+# ==============================================================
 #  Streaming parser thresholds
 # ==============================================================
 
