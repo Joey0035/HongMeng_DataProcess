@@ -52,7 +52,7 @@ TEMP_SENSOR_LABELS = [
     f"Chip{i}-Ch{j}" for i in range(TEMP_N_CHIPS) for j in range(TEMP_CH_PER_CHIP)
 ]
 
-DEFAULT_TEMP_THRESHOLDS = {'high': 60.0, 'low': -10.0}
+DEFAULT_TEMP_THRESHOLDS = {'high': 100.0, 'low': -10.0}
 
 # ==============================================================
 #  Anomaly display names

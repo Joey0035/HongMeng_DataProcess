@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import streamlit as st
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import data_manager
 import data_processor as dp
@@ -51,8 +51,12 @@ with col_nf:
 # Get frequency axis
 freq_mhz = dp.get_vna_freq_mhz(selected_nf, vna_freq_config)
 
-# Split by source for this n_freq
-split_data, split_time = dp.split_vna_by_src_with_time(result, n_freq=selected_nf)
+# Use pre-computed split (cached in session_state by store_in_session)
+_vna_splits = st.session_state.get('cache_vna_splits', {})
+if selected_nf in _vna_splits:
+    split_data, split_time = _vna_splits[selected_nf]
+else:
+    split_data, split_time = dp.split_vna_by_src_with_time(result, n_freq=selected_nf)
 src_names = list(split_data.keys())
 
 with col_time:
@@ -65,7 +69,8 @@ with col_time:
             min_value=t_min_dt,
             max_value=t_max_dt,
             value=(t_min_dt, t_max_dt),
-            format="HH:mm:ss",
+            format="MM/DD HH:mm",
+            step=timedelta(minutes=30),
             key="vna_time_range",
         )
         t_start = time_range[0].timestamp()
@@ -137,16 +142,20 @@ with st.expander("OSL Calibration", expanded=False):
 cal_diag = None
 if cal_enabled and not missing_sw and freq_mhz is not None:
     with st.spinner("Applying OSL calibration..."):
-        cal_data, cal_diag = dp.apply_vna_calibration(
-            split_data=split_data,
-            freq_mhz=freq_mhz,
-            switch_cal_keys=CAL_SWITCH_PLANE,
-            lna_cal_keys=CAL_LNA_PLANE if not missing_lna else None,
-            cable_length_m=cable_len,
-            cable_vf=cable_vf,
-            cable_loss=cable_loss,
-            snp_file_path=snp_file_path,
-        )
+        try:
+            cal_data, cal_diag = dp.apply_vna_calibration(
+                split_data=split_data,
+                freq_mhz=freq_mhz,
+                switch_cal_keys=CAL_SWITCH_PLANE,
+                lna_cal_keys=CAL_LNA_PLANE if not missing_lna else None,
+                cable_length_m=cable_len,
+                cable_vf=cable_vf,
+                cable_loss=cable_loss,
+                snp_file_path=snp_file_path,
+            )
+        finally:
+            if snp_file_path:
+                Path(snp_file_path).unlink(missing_ok=True)
     split_data = cal_data
     split_time = {k: v for k, v in split_time.items() if k in split_data}
     src_names = list(split_data.keys())
@@ -166,24 +175,36 @@ with btn_col1:
 with btn_col2:
     deselect_all = st.button("Deselect All", key="vna_desel_all", use_container_width=True)
 
-state_key = f'vna_src_state_{selected_nf}'
+# Use a different state key for cal vs raw so that enabling cal resets defaults
+_state_suffix = 'cal' if cal_enabled else 'raw'
+state_key = f'vna_src_state_{selected_nf}_{_state_suffix}'
+_cb_prefix = f"vna_cb_{selected_nf}_{_state_suffix}"
+
+# Cal standard source names — hidden by default when calibration is enabled
+_cal_std_names = set(CAL_SWITCH_PLANE.values()) | set(CAL_LNA_PLANE.values())
+
 if select_all:
     st.session_state[state_key] = {name: True for name in src_names}
     for name in src_names:
-        st.session_state[f"vna_cb_{selected_nf}_{name}"] = True
+        st.session_state[f"{_cb_prefix}_{name}"] = True
     st.rerun()
 if deselect_all:
     st.session_state[state_key] = {name: False for name in src_names}
     for name in src_names:
-        st.session_state[f"vna_cb_{selected_nf}_{name}"] = False
+        st.session_state[f"{_cb_prefix}_{name}"] = False
     st.rerun()
 
-# Initialize: default all selected
+# Initialize: default all selected; cal standards unchecked when cal is enabled
 if state_key not in st.session_state:
-    st.session_state[state_key] = {name: True for name in src_names}
+    st.session_state[state_key] = {
+        name: (False if cal_enabled and name in _cal_std_names else True)
+        for name in src_names
+    }
 for name in src_names:
     if name not in st.session_state[state_key]:
-        st.session_state[state_key][name] = True
+        st.session_state[state_key][name] = (
+            False if cal_enabled and name in _cal_std_names else True
+        )
 # Remove stale keys no longer in src_names (e.g., standards removed by calibration)
 st.session_state[state_key] = {
     k: v for k, v in st.session_state[state_key].items() if k in src_names
@@ -195,7 +216,7 @@ for idx, name in enumerate(src_names):
     with grid_cols[idx % n_cols]:
         st.session_state[state_key][name] = st.checkbox(
             name, value=st.session_state[state_key].get(name, True),
-            key=f"vna_cb_{selected_nf}_{name}",
+            key=f"{_cb_prefix}_{name}",
         )
 
 selected_sources = [name for name in src_names if st.session_state[state_key].get(name, False)]
@@ -219,20 +240,6 @@ with tabs[0]:
             filtered_split, freq_mhz,
             time_range=(t_start, t_end), split_time=filtered_time,
         )
-        # Overlay calibration standard model (ideal) curves
-        if cal_diag is not None:
-            import plotly.graph_objects as go
-            std_self = cal_diag.get('standards_self_cal', {})
-            n_existing = len(fig.data)
-            for idx, (std_name, info) in enumerate(std_self.items()):
-                expected = info['expected']
-                xv = freq_mhz if freq_mhz is not None else np.arange(len(expected))
-                fig.add_trace(go.Scatter(
-                    x=xv, y=20 * np.log10(np.abs(expected).clip(1e-30)),
-                    mode='lines', name=f"{std_name} (model)",
-                    line=dict(color=plot_utils._pick_color(n_existing + idx), width=1.5, dash='dash'),
-                    legendgroup='cal_model', legendgrouptitle_text='Ideal Standards',
-                ))
         st.plotly_chart(fig, use_container_width=True)
     else:
         st.info("Select at least one source.")
@@ -266,8 +273,15 @@ with tabs[2]:
         wf_source = st.selectbox("Waterfall Source",
                                  selected_sources if selected_sources else src_names,
                                  key="vna_wf_source")
-        wf_mode = st.radio("Display", ["Magnitude (dB)", "Phase (deg)"],
-                           horizontal=True, key="vna_wf_mode")
+        _wf_ctrl1, _wf_ctrl2 = st.columns([1, 2])
+        with _wf_ctrl1:
+            wf_mode = st.radio("Display", ["Magnitude (dB)", "Phase (deg)"],
+                               horizontal=True, key="vna_wf_mode")
+        with _wf_ctrl2:
+            _vna_wf_cmap_opts = (plot_utils.COLORMAP_OPTIONS_PHASE
+                                 if wf_mode == "Phase (deg)"
+                                 else plot_utils.COLORMAP_OPTIONS_MAG)
+            vna_wf_cmap = st.selectbox("Color Map", _vna_wf_cmap_opts, key="vna_wf_colormap")
 
         if wf_source in split_data:
             data_src = split_data[wf_source]
@@ -290,7 +304,7 @@ with tabs[2]:
                 fig_wf = plot_utils.create_vna_waterfall(
                     data_ds, freq_mhz, time_labels_ds,
                     f"VNA Waterfall -- {wf_source} -- {'Phase' if is_phase else '|S11|'}",
-                    is_phase=is_phase,
+                    is_phase=is_phase, colorscale=vna_wf_cmap,
                 )
                 st.plotly_chart(fig_wf, use_container_width=True)
             else:
@@ -319,6 +333,10 @@ with tabs[3]:
                                         key="vna_wf_array_per_page")
         vna_wf_mode = st.radio("Display", ["Magnitude (dB)", "Phase (deg)"],
                                horizontal=True, key="vna_wf_array_mode")
+        _vna_arr_cmap_opts = (plot_utils.COLORMAP_OPTIONS_PHASE
+                              if vna_wf_mode == "Phase (deg)"
+                              else plot_utils.COLORMAP_OPTIONS_MAG)
+        vna_arr_cmap = st.selectbox("Color Map", _vna_arr_cmap_opts, key="vna_wf_array_colormap")
 
         wf_arr_data = {}
         wf_arr_times = {}
@@ -357,6 +375,7 @@ with tabs[3]:
             fig_arr = plot_utils.create_vna_waterfall_array(
                 page_data, freq_mhz, page_times,
                 is_phase=is_phase, freq_range=vna_fr, n_cols=n_grid_cols,
+                colorscale=vna_arr_cmap,
             )
             st.plotly_chart(fig_arr, use_container_width=True)
         else:
@@ -407,12 +426,18 @@ if cal_diag is not None:
             x = freq_mhz if freq_mhz is not None else None
             x_label = "Frequency (MHz)" if freq_mhz is not None else "Freq Index"
 
+            # 预计算每个标准的 cal_mean，避免在三个循环中各算一次
+            cal_means = {
+                std_name: (np.mean(info['calibrated'], axis=0)
+                           if info['calibrated'].ndim == 2 else info['calibrated'])
+                for std_name, info in std_self.items()
+            }
+
             # |Γ| magnitude plot
             fig_mag = go.Figure()
             for idx, (std_name, info) in enumerate(std_self.items()):
-                cal_data_std = info['calibrated']
+                cal_mean = cal_means[std_name]
                 expected = info['expected']
-                cal_mean = np.mean(cal_data_std, axis=0) if cal_data_std.ndim == 2 else cal_data_std
                 xv = x if x is not None else np.arange(len(cal_mean))
 
                 fig_mag.add_trace(go.Scatter(
@@ -435,9 +460,8 @@ if cal_diag is not None:
             # Residual error plot
             fig_err = go.Figure()
             for idx, (std_name, info) in enumerate(std_self.items()):
-                cal_data_std = info['calibrated']
+                cal_mean = cal_means[std_name]
                 expected = info['expected']
-                cal_mean = np.mean(cal_data_std, axis=0) if cal_data_std.ndim == 2 else cal_data_std
                 residual = np.abs(cal_mean - expected)
                 xv = x if x is not None else np.arange(len(residual))
 
@@ -457,9 +481,8 @@ if cal_diag is not None:
             # Per-standard stats table
             rows = []
             for std_name, info in std_self.items():
-                cal_data_std = info['calibrated']
+                cal_mean = cal_means[std_name]
                 expected = info['expected']
-                cal_mean = np.mean(cal_data_std, axis=0) if cal_data_std.ndim == 2 else cal_data_std
                 residual = np.abs(cal_mean - expected)
                 rows.append({
                     'Standard': std_name,

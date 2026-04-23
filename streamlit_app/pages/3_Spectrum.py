@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import streamlit as st
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import data_manager
 import data_processor as dp
@@ -17,6 +17,21 @@ from config import DTYPE_INDEX_MAP, DTYPE_LABELS, SOURCE_LABEL_MAP
 from theme import apply_theme
 
 apply_theme()
+
+@st.cache_data
+def _prepare_wf_source(d: np.ndarray, t_arr: np.ndarray,
+                       t_start: float, t_end: float,
+                       channel_idx: int, max_rows: int = 200):
+    """时间过滤 + 通道提取 + 降采样，结果缓存，time_range/channel 变化时自动失效"""
+    mask = (t_arr >= t_start) & (t_arr <= t_end)
+    d_f = d[mask]
+    t_f = t_arr[mask]
+    if len(d_f) == 0:
+        return None, None
+    wf_d = d_f[:, channel_idx, :]
+    tl = dp.timestamps_to_datetime_strings(t_f)
+    wf_d, tl, _ = dp.downsample_waterfall(wf_d, tl, max_rows=max_rows)
+    return wf_d, tl
 
 st.title("Spectrum Analysis (SPEC)")
 
@@ -32,8 +47,12 @@ if 'spec' not in result:
 spec = result['spec']
 freq_mhz = dp.get_spec_freq_mhz()
 
-# Split by source (with time)
-split_data, split_time = dp.split_spec_by_src_with_time(result)
+# Use pre-computed split (cached in session_state by store_in_session)
+_cached = st.session_state.get('cache_spec_split')
+if _cached is not None:
+    split_data, split_time = _cached
+else:
+    split_data, split_time = dp.split_spec_by_src_with_time(result)
 src_names = list(split_data.keys())
 
 # ==============================================================
@@ -55,7 +74,8 @@ with col_time:
         min_value=t_min_dt,
         max_value=t_max_dt,
         value=(t_min_dt, t_max_dt),
-        format="HH:mm:ss",
+        format="MM/DD HH:mm",
+        step=timedelta(minutes=30),
         key="spec_time_range",
     )
 
@@ -122,8 +142,13 @@ with tab1:
 
 with tab2:
     if src_names:
-        wf_source = st.selectbox("Waterfall Source", selected_sources if selected_sources else src_names,
-                                 key="wf_source")
+        _wf_c1, _wf_c2 = st.columns([3, 1])
+        with _wf_c1:
+            wf_source = st.selectbox("Waterfall Source", selected_sources if selected_sources else src_names,
+                                     key="wf_source")
+        with _wf_c2:
+            wf_cmap = st.selectbox("Color Map", plot_utils.COLORMAP_OPTIONS_MAG,
+                                   key="spec_wf_colormap")
         if wf_source in split_data:
             data_src = split_data[wf_source]
             time_src = split_time[wf_source]
@@ -135,13 +160,26 @@ with tab2:
 
             if len(data_filtered) > 0:
                 wf_data = data_filtered[:, channel_idx, :]
+                _wf_fmin = float(freq_mhz[0])
+                _wf_fmax = float(freq_mhz[-1])
+                _wf_def_lo = max(_wf_fmin, 30.0)
+                _wf_def_hi = min(_wf_fmax, 200.0)
+                if _wf_def_lo >= _wf_def_hi:
+                    _wf_def_lo, _wf_def_hi = _wf_fmin, _wf_fmax
+                wf_freq_range = st.slider(
+                    "Frequency Range (MHz)", min_value=_wf_fmin, max_value=_wf_fmax,
+                    value=(_wf_def_lo, _wf_def_hi), key="spec_wf_freq",
+                )
                 time_labels = dp.timestamps_to_datetime_strings(time_filtered)
                 wf_data, time_labels, ds = dp.downsample_waterfall(wf_data, time_labels)
                 if ds:
                     st.info(f"Downsampled from {len(time_filtered)} to {len(time_labels)} time steps for display.")
+                # Apply freq slice
+                _f_mask = (freq_mhz >= wf_freq_range[0]) & (freq_mhz <= wf_freq_range[1])
                 fig_wf = plot_utils.create_spec_waterfall(
-                    wf_data, freq_mhz, time_labels,
-                    f"Waterfall -- {wf_source} -- {channel_name}"
+                    wf_data[:, _f_mask], freq_mhz[_f_mask], time_labels,
+                    f"Waterfall -- {wf_source} -- {channel_name}",
+                    colorscale=wf_cmap,
                 )
                 st.plotly_chart(fig_wf, use_container_width=True)
             else:
@@ -152,11 +190,15 @@ with tab2:
 with tab3:
     if filtered_split:
         freq_min_val, freq_max_val = float(freq_mhz[0]), float(freq_mhz[-1])
-        ctrl1, ctrl2, ctrl3 = st.columns([3, 1, 1])
+        _arr_def_lo = max(freq_min_val, 30.0)
+        _arr_def_hi = min(freq_max_val, 200.0)
+        if _arr_def_lo >= _arr_def_hi:
+            _arr_def_lo, _arr_def_hi = freq_min_val, freq_max_val
+        ctrl1, ctrl2, ctrl3, ctrl4 = st.columns([3, 1, 1, 1.5])
         with ctrl1:
             spec_fr = st.slider(
                 "Frequency Range (MHz)", min_value=freq_min_val, max_value=freq_max_val,
-                value=(freq_min_val, freq_max_val), key="spec_wf_array_freq",
+                value=(_arr_def_lo, _arr_def_hi), key="spec_wf_array_freq",
             )
         with ctrl2:
             n_grid_cols = st.select_slider("Columns", options=[2, 3, 4, 5, 6], value=3,
@@ -164,24 +206,22 @@ with tab3:
         with ctrl3:
             per_page = st.select_slider("Sources/Page", options=[4, 6, 8, 12, 16], value=6,
                                         key="spec_wf_array_per_page")
+        with ctrl4:
+            arr_cmap = st.selectbox("Color Map", plot_utils.COLORMAP_OPTIONS_MAG,
+                                    key="spec_wf_array_colormap")
 
-        # Prepare data: time-filter + channel select + downsample per source
+        # Prepare data: time-filter + channel select + downsample per source (cached)
         wf_array_data = {}
         wf_array_times = {}
         for name in selected_sources:
             if name not in split_data:
                 continue
-            d = split_data[name]
-            t_arr = split_time[name]
-            mask = (t_arr >= t_start) & (t_arr <= t_end)
-            d_f = d[mask]
-            t_f = t_arr[mask]
-            if len(d_f) == 0:
+            wf_d, tl = _prepare_wf_source(
+                split_data[name], split_time[name],
+                t_start, t_end, channel_idx,
+            )
+            if wf_d is None:
                 continue
-            # Extract channel first, then downsample (more aggressive for array)
-            wf_d = d_f[:, channel_idx, :]
-            tl = dp.timestamps_to_datetime_strings(t_f)
-            wf_d, tl, _ = dp.downsample_waterfall(wf_d, tl, max_rows=200)
             wf_array_data[name] = wf_d
             wf_array_times[name] = tl
 
@@ -200,7 +240,7 @@ with tab3:
 
             fig_arr = plot_utils.create_spec_waterfall_array(
                 page_data, freq_mhz, page_times, channel_name,
-                freq_range=spec_fr, n_cols=n_grid_cols,
+                freq_range=spec_fr, n_cols=n_grid_cols, colorscale=arr_cmap,
             )
             st.plotly_chart(fig_arr, use_container_width=True)
         else:

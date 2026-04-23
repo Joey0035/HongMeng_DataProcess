@@ -1,12 +1,47 @@
 """
 plot_utils.py — Plotly chart factory functions with dark/light theme support.
 All functions return plotly.graph_objects.Figure instances.
+
+Performance notes:
+  - Line charts use go.Scattergl (WebGL) instead of go.Scatter (SVG).
+  - Heatmap frequency axes are downsampled to _MAX_HEATMAP_FREQ bins so
+    each heatmap sends at most ~512 columns to the browser.
 """
 
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime
+
+# Maximum frequency bins sent to browser for heatmap traces.
+# 4096 → 512 reduces heatmap JSON payload ~8× with no perceptible quality loss.
+_MAX_HEATMAP_FREQ = 512
+
+# Maximum frequency bins for 1D line plots (SPEC). Halves JSON payload vs 4096.
+_MAX_1D_FREQ = 2048
+
+# Maximum time-steps per temperature trace sent to browser.
+_MAX_TEMP_POINTS = 2000
+
+# Colormap options exposed to the UI for waterfall charts.
+COLORMAP_OPTIONS_MAG = ['Inferno', 'Viridis', 'Plasma', 'Magma', 'Hot', 'Jet', 'Turbo', 'Cividis', 'YlOrRd']
+COLORMAP_OPTIONS_PHASE = ['RdBu', 'HSV', 'IceFire', 'Twilight', 'Jet', 'Plasma', 'Picnic']
+
+
+def _downsample_freq(data_2d: np.ndarray,
+                     freq: np.ndarray) -> tuple:
+    """Uniformly downsample the frequency (column) axis of a 2-D array.
+
+    Returns (downsampled_data_2d, downsampled_freq).
+    No-op when the number of columns is already ≤ _MAX_HEATMAP_FREQ.
+    """
+    n = data_2d.shape[1]
+    if n <= _MAX_HEATMAP_FREQ:
+        return data_2d, freq
+    step = max(1, n // _MAX_HEATMAP_FREQ)
+    idx = np.arange(0, n, step)[:_MAX_HEATMAP_FREQ]
+    freq_out = freq[idx] if freq is not None else None
+    return data_2d[:, idx], freq_out
 
 
 # ==============================================================
@@ -144,6 +179,16 @@ def create_spec_1d_plot(split_data: dict, channel_idx: int,
                         freq_mhz: np.ndarray, channel_name: str,
                         time_range: tuple = None,
                         split_time: dict = None) -> go.Figure:
+    # Downsample frequency axis for 1D plot to reduce browser payload
+    n_freq = len(freq_mhz)
+    if n_freq > _MAX_1D_FREQ:
+        step = max(1, n_freq // _MAX_1D_FREQ)
+        freq_idx = np.arange(0, n_freq, step)[:_MAX_1D_FREQ]
+        freq_plot = freq_mhz[freq_idx]
+    else:
+        freq_idx = None
+        freq_plot = freq_mhz
+
     fig = go.Figure()
     for i, (name, data) in enumerate(split_data.items()):
         if time_range and split_time and name in split_time:
@@ -155,9 +200,11 @@ def create_spec_1d_plot(split_data: dict, channel_idx: int,
         if len(d) == 0:
             continue
         mean_spec = np.mean(d[:, channel_idx, :].astype(float), axis=0)
+        if freq_idx is not None:
+            mean_spec = mean_spec[freq_idx]
         dB = 10 * np.log10(np.abs(mean_spec).clip(1e-30))
-        fig.add_trace(go.Scatter(
-            x=freq_mhz, y=dB, mode='lines', name=name,
+        fig.add_trace(go.Scattergl(
+            x=freq_plot, y=dB, mode='lines', name=name,
             line=dict(color=_pick_color(i), width=1.5),
         ))
     fig.update_layout(**_themed_layout(
@@ -170,11 +217,14 @@ def create_spec_1d_plot(split_data: dict, channel_idx: int,
 
 
 def create_spec_waterfall(data_2d: np.ndarray, freq_mhz: np.ndarray,
-                          times: list, title: str) -> go.Figure:
+                          times: list, title: str,
+                          colorscale=None) -> go.Figure:
     dB = 10 * np.log10(np.abs(data_2d).astype(float).clip(1e-30))
+    dB, freq_mhz = _downsample_freq(dB, freq_mhz)
+    cscale = colorscale if colorscale is not None else _t()['heatmap_scale']
     fig = go.Figure(data=go.Heatmap(
         z=dB, x=freq_mhz, y=times,
-        colorscale=_t()['heatmap_scale'],
+        colorscale=cscale,
         colorbar=dict(title=dict(text='Power (dB)', font=_tick_font()), tickfont=_tick_font()),
     ))
     fig.update_layout(**_themed_layout(
@@ -205,7 +255,7 @@ def create_vna_magnitude_plot(split_data: dict, freq_mhz: np.ndarray,
         if x is None:
             x = np.arange(d.shape[1])
         dB = 20 * np.log10(np.abs(d).mean(axis=0).clip(1e-30))
-        fig.add_trace(go.Scatter(x=x, y=dB, mode='lines', name=name,
+        fig.add_trace(go.Scattergl(x=x, y=dB, mode='lines', name=name,
                                  line=dict(color=_pick_color(i), width=1.5)))
     fig.update_layout(**_themed_layout(
         title='|S11| // Time Integrated',
@@ -233,7 +283,7 @@ def create_vna_phase_plot(split_data: dict, freq_mhz: np.ndarray,
         if x is None:
             x = np.arange(d.shape[1])
         phase = np.angle(d.mean(axis=0), deg=True)
-        fig.add_trace(go.Scatter(x=x, y=phase, mode='lines', name=name,
+        fig.add_trace(go.Scattergl(x=x, y=phase, mode='lines', name=name,
                                  line=dict(color=_pick_color(i), width=1.5)))
     fig.update_layout(**_themed_layout(
         title='S11 Phase // Time Integrated',
@@ -244,18 +294,22 @@ def create_vna_phase_plot(split_data: dict, freq_mhz: np.ndarray,
 
 
 def create_vna_waterfall(data_2d: np.ndarray, freq_mhz: np.ndarray,
-                         times: list, title: str, is_phase: bool = False) -> go.Figure:
+                         times: list, title: str, is_phase: bool = False,
+                         colorscale=None) -> go.Figure:
     if isinstance(data_2d, list):
         data_2d = np.stack(data_2d)
     t = _t()
     if is_phase:
         z = np.angle(data_2d, deg=True)
-        cbar_title, cscale = 'Phase (deg)', t['phase_scale']
+        cbar_title = 'Phase (deg)'
+        cscale = colorscale if colorscale is not None else t['phase_scale']
     else:
         z = 20 * np.log10(np.abs(data_2d).astype(float).clip(1e-30))
-        cbar_title, cscale = '|S11| (dB)', t['heatmap_scale']
+        cbar_title = '|S11| (dB)'
+        cscale = colorscale if colorscale is not None else t['heatmap_scale']
     has_freq = freq_mhz is not None
     x = freq_mhz if has_freq else np.arange(z.shape[1])
+    z, x = _downsample_freq(z, x)
     fig = go.Figure(data=go.Heatmap(
         z=z, x=x, y=times, colorscale=cscale,
         colorbar=dict(title=dict(text=cbar_title, font=_tick_font()), tickfont=_tick_font()),
@@ -315,18 +369,28 @@ def create_smith_chart(s11_dict: dict, freq_mhz: np.ndarray = None) -> go.Figure
         if isinstance(s11, list):
             s11 = np.stack(s11)
         mean_s11 = s11.mean(axis=0) if s11.ndim == 2 else s11
-        hover = []
-        for k in range(len(mean_s11)):
-            txt = f"{name}<br>|S11|={20*np.log10(max(abs(mean_s11[k]),1e-30)):.1f} dB"
-            txt += f"<br>Phase={np.angle(mean_s11[k], deg=True):.1f} deg"
-            if freq_mhz is not None and k < len(freq_mhz):
-                txt += f"<br>Freq={freq_mhz[k]:.1f} MHz"
-            hover.append(txt)
+        n_pts = len(mean_s11)
+        # 向量化构建 hover 数据（避免 Python 逐频点循环）
+        mag_db  = 20 * np.log10(np.abs(mean_s11).clip(1e-30))
+        phase_d = np.angle(mean_s11, deg=True)
+        if freq_mhz is not None:
+            fq = freq_mhz[:n_pts]
+            custom = np.column_stack([mag_db, phase_d, fq])
+            htmpl = (f"{name}<br>"
+                     "|S11|=%{customdata[0]:.1f} dB<br>"
+                     "Phase=%{customdata[1]:.1f}°<br>"
+                     "Freq=%{customdata[2]:.1f} MHz<extra></extra>")
+        else:
+            custom = np.column_stack([mag_db, phase_d, np.arange(n_pts)])
+            htmpl = (f"{name}<br>"
+                     "|S11|=%{customdata[0]:.1f} dB<br>"
+                     "Phase=%{customdata[1]:.1f}°<br>"
+                     "Index=%{customdata[2]:.0f}<extra></extra>")
         c = _pick_color(i)
-        fig.add_trace(go.Scatter(
+        fig.add_trace(go.Scattergl(
             x=mean_s11.real, y=mean_s11.imag, mode='lines+markers', name=name,
             marker=dict(size=3, color=c), line=dict(color=c, width=1.5),
-            text=hover, hoverinfo='text'))
+            customdata=custom, hovertemplate=htmpl))
 
     fig.update_layout(
         title=dict(text='Smith Chart', font=_title_font()),
@@ -351,19 +415,31 @@ def create_temp_timeseries(temp_data: np.ndarray, time_arr: np.ndarray,
                            selected_points: list, thresholds: dict) -> go.Figure:
     fig = go.Figure()
     t = _t()
+    # Downsample time axis to keep browser rendering fast
+    n = len(time_arr)
+    if n > _MAX_TEMP_POINTS:
+        step = max(1, n // _MAX_TEMP_POINTS)
+        idx = np.arange(0, n, step)
+        time_arr = time_arr[idx]
+        temp_data = temp_data[idx]
     dt_list = [datetime.fromtimestamp(float(v)) for v in time_arr]
     for i, (chip, ch, label) in enumerate(selected_points):
-        fig.add_trace(go.Scatter(
+        fig.add_trace(go.Scattergl(
             x=dt_list, y=temp_data[:, chip, ch], mode='lines', name=label,
             line=dict(color=_pick_color(i), width=1.5)))
-    if thresholds.get('high') is not None:
-        fig.add_hline(y=thresholds['high'], line_dash='dash', line_color=t['th_high'],
-                      annotation_text=f"HIGH {thresholds['high']}°C",
-                      annotation_font=dict(color=t['th_high'], size=13))
-    if thresholds.get('low') is not None:
-        fig.add_hline(y=thresholds['low'], line_dash='dash', line_color=t['th_low'],
-                      annotation_text=f"LOW {thresholds['low']}°C",
-                      annotation_font=dict(color=t['th_low'], size=13))
+    # Only draw threshold lines when at least one probe actually exceeds the limit
+    high = thresholds.get('high')
+    low = thresholds.get('low')
+    if high is not None and selected_points:
+        if any(np.nanmax(temp_data[:, chip, ch]) > high for chip, ch, _ in selected_points):
+            fig.add_hline(y=high, line_dash='dash', line_color=t['th_high'],
+                          annotation_text=f"HIGH {high}°C",
+                          annotation_font=dict(color=t['th_high'], size=13))
+    if low is not None and selected_points:
+        if any(np.nanmin(temp_data[:, chip, ch]) < low for chip, ch, _ in selected_points):
+            fig.add_hline(y=low, line_dash='dash', line_color=t['th_low'],
+                          annotation_text=f"LOW {low}°C",
+                          annotation_font=dict(color=t['th_low'], size=13))
     fig.update_layout(**_themed_layout(
         title='Temperature Monitor', xaxis_title='Time',
         yaxis_title='Temperature (°C)', height=520))
@@ -450,6 +526,7 @@ def _build_waterfall_grid(names: list, data_dict: dict, freq_mhz, time_labels_di
         if isinstance(d, list):
             d = np.stack(d)
         d, x = _apply_freq_slice(d, freq_mhz, freq_range)
+        d, x = _downsample_freq(d, x)
         if x is None:
             x = np.arange(d.shape[1])
         z = z_func(d)
@@ -465,10 +542,10 @@ def _build_waterfall_grid(names: list, data_dict: dict, freq_mhz, time_labels_di
         z_arrays.append(z)
 
     # Second pass: read real domains and position colorbars precisely
+    # 累积所有 coloraxis 更新，单次调用 update_layout 避免循环内多次 layout 拷贝
     domains = _get_subplot_domains(fig, n)
+    layout_updates = {}
     for i, name in enumerate(names):
-        row = i // n_cols + 1
-        col = i % n_cols + 1
         xd, yd = domains[i]  # ([x0, x1], [y0, y1])
 
         caxis_name = f'coloraxis{i + 1}'
@@ -476,29 +553,21 @@ def _build_waterfall_grid(names: list, data_dict: dict, freq_mhz, time_labels_di
         cb_x = xd[1] + 0.008          # just to the right of subplot
         cb_y = (yd[0] + yd[1]) / 2    # vertically centered
 
-        fig.update_layout(**{
-            caxis_name: dict(
-                colorscale=colorscale,
-                colorbar=dict(
-                    tickfont=dict(size=7, color=t['text']),
-                    thickness=6,
-                    len=cb_len,
-                    y=cb_y,
-                    x=cb_x,
-                    xpad=1, ypad=0,
-                    ticks='outside', ticklen=2,
-                    title=dict(text=''),  # no title to save space
-                ),
+        layout_updates[caxis_name] = dict(
+            colorscale=colorscale,
+            colorbar=dict(
+                tickfont=dict(size=7, color=t['text']),
+                thickness=6,
+                len=cb_len,
+                y=cb_y,
+                x=cb_x,
+                xpad=1, ypad=0,
+                ticks='outside', ticklen=2,
+                title=dict(text=''),  # no title to save space
             ),
-        })
+        )
 
-        # Hide y-tick labels for non-leftmost columns
-        ax_suffix = '' if i == 0 else str(i + 1)
-        if col > 1:
-            fig.layout[f'yaxis{ax_suffix}'].showticklabels = False
-        # Hide x-tick labels for non-bottom rows
-        if row < n_rows:
-            fig.layout[f'xaxis{ax_suffix}'].showticklabels = False
+    fig.update_layout(**layout_updates)
 
     _style_subplot_fig(fig, title, n_rows, n_cols)
     return fig
@@ -508,14 +577,16 @@ def create_spec_waterfall_array(
     split_data: dict, freq_mhz: np.ndarray,
     time_labels_dict: dict, channel_name: str,
     freq_range: tuple = None, n_cols: int = 3,
+    colorscale=None,
 ) -> go.Figure:
     """Create a grid of SPEC waterfall heatmaps, one per source."""
     t = _t()
+    cscale = colorscale if colorscale is not None else t['heatmap_scale']
     return _build_waterfall_grid(
         names=list(split_data.keys()),
         data_dict=split_data, freq_mhz=freq_mhz,
         time_labels_dict=time_labels_dict, n_cols=n_cols,
-        freq_range=freq_range, colorscale=t['heatmap_scale'],
+        freq_range=freq_range, colorscale=cscale,
         cbar_title='dB',
         z_func=lambda d: 10 * np.log10(np.abs(d).astype(float).clip(1e-30)),
         title=f'Waterfall Array // {channel_name}',
@@ -526,10 +597,16 @@ def create_vna_waterfall_array(
     split_data: dict, freq_mhz: np.ndarray,
     time_labels_dict: dict, is_phase: bool = False,
     freq_range: tuple = None, n_cols: int = 3,
+    colorscale=None,
 ) -> go.Figure:
     """Create a grid of VNA waterfall heatmaps, one per source."""
     t = _t()
-    cscale = t['phase_scale'] if is_phase else t['heatmap_scale']
+    if colorscale is not None:
+        cscale = colorscale
+    elif is_phase:
+        cscale = t['phase_scale']
+    else:
+        cscale = t['heatmap_scale']
     cbar_title = 'Phase (°)' if is_phase else '|S11| (dB)'
     if is_phase:
         z_func = lambda d: np.angle(d, deg=True)

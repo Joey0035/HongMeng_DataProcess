@@ -4,6 +4,7 @@ frequency axes, and time conversion. No Streamlit or Plotly imports.
 """
 
 import numpy as np
+import pandas as pd
 from datetime import datetime
 from typing import Optional
 
@@ -206,7 +207,7 @@ def timestamps_to_datetime(time_arr: np.ndarray) -> list:
 
 
 def timestamps_to_datetime_strings(time_arr: np.ndarray, fmt: str = '%H:%M:%S') -> list:
-    return [datetime.fromtimestamp(float(t)).strftime(fmt) for t in time_arr]
+    return pd.to_datetime(time_arr, unit='s').strftime(fmt).tolist()
 
 
 # ==============================================================
@@ -232,9 +233,8 @@ def compute_temp_statistics(temp_data: np.ndarray, time_arr: np.ndarray,
     filtered = temp_data[mask]
 
     # Global stats across ALL points
-    valid = filtered[~np.isnan(filtered)]
-    global_max = float(np.nanmax(valid)) if len(valid) > 0 else float('nan')
-    global_min = float(np.nanmin(valid)) if len(valid) > 0 else float('nan')
+    global_max = float(np.nanmax(filtered)) if filtered.size > 0 else float('nan')
+    global_min = float(np.nanmin(filtered)) if filtered.size > 0 else float('nan')
 
     per_point = {}
     for chip, ch in selected_indices:

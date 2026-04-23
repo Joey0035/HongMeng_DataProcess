@@ -126,7 +126,7 @@ class PacketParser:
         self._last_fail_reason: str = ""
 
     def calc_checksum(self, data: bytes) -> int:
-        return sum(data) & 0xFFFF
+        return int(np.frombuffer(data, dtype=np.uint8).sum(dtype=np.int64)) & 0xFFFF
 
     def parse_packet(self, buf: bytes | memoryview) -> Optional[SpecPacket]:
         """解析单个数据包
@@ -203,7 +203,7 @@ class PacketParser:
             # 校验和验证：副导头(时间码) + 有效数据域(src_num + valid_data_len字段 + 全部科学数据含填充)
             checksum_start = PACKET_HEADER_SIZE  # offset 9
             checksum_end = offset                 # 9 + data_len - 2
-            calc_sum = self.calc_checksum(bytes(buf[checksum_start:checksum_end]))
+            calc_sum = self.calc_checksum(buf[checksum_start:checksum_end])
             if calc_sum != checksum:
                 self._last_fail_reason = (
                     f"checksum_mismatch(calc=0x{calc_sum:04X},stored=0x{checksum:04X})"
@@ -279,7 +279,7 @@ class PacketParser:
     ) -> list:
         """流式解析数据包"""
         packets = []
-        buf = b""
+        buf = bytearray()          # bytearray.extend() 避免每次 += 全量拷贝
         file_size = file_path.stat().st_size
         bytes_read = 0
         buf_file_offset = 0  # buf[0] 对应的文件偏移
@@ -293,7 +293,7 @@ class PacketParser:
                     break
 
                 bytes_read += len(chunk)
-                buf += chunk
+                buf.extend(chunk)           # 原地追加，无拷贝
 
                 # 处理缓冲区并获取未处理部分
                 packets_chunk, buf, consumed = self._extract_packets_from_buffer(
@@ -335,8 +335,8 @@ class PacketParser:
         return packets
 
     def _extract_packets_from_buffer(
-        self, buf: bytes, base_offset: int = 0
-    ) -> Tuple[list, bytes, int]:
+        self, buf: bytes | bytearray, base_offset: int = 0
+    ) -> Tuple[list, bytes | bytearray, int]:
         """从缓冲区提取数据包
 
         Parameters
@@ -357,9 +357,13 @@ class PacketParser:
         first_sync_found = False
 
         while offset + PACKET_HEADER_SIZE <= buf_len:
-            # 查找同步码
+            # 查找同步码 — 找不到时用 C 速度跳跃，避免逐字节 Python 循环
             if mv[offset:offset + 2] != SYNC_WORD:
-                offset += 1
+                nxt = buf.find(SYNC_WORD, offset + 1)
+                if nxt < 0:
+                    offset = buf_len
+                    break
+                offset = nxt
                 continue
 
             # 记录首次同步码前跳过的字节（不完整的头部数据）
@@ -443,47 +447,18 @@ class PacketParser:
 class SciDataProcessor:
 
     @staticmethod
-    def bytes_to_int64_vec(data_views: list) -> np.ndarray:
-        """批量转换bytes到int64"""
-        n = len(data_views)
-        result = np.empty(n, dtype=np.int64)
-
-        # SIMD优化的转换
-        mask = (1 << 68) - 1
-        offset = 1 << 68
-
-        for i, data in enumerate(data_views):
-            val = int.from_bytes(data, 'big') & mask
-            result[i] = val - offset if (val >> 67) & 1 else val
-
-        return result
-
-    @staticmethod
     def process_spec_block(packets: list) -> np.ndarray:
-        """处理单个spec块（64个packets）"""
+        """处理单个spec块（64个packets）— 单次 join + reshape，无逐通道循环"""
         if len(packets) != PACKETS_PER_SPEC:
             raise ValueError(f"Expected {PACKETS_PER_SPEC} packets, got {len(packets)}")
-
-        # 预分配结果数组
-        result = np.zeros((CHANNELS_PER_SPEC, VALUES_PER_CHANNEL), dtype=np.int64)
-
-        for class_idx in range(CHANNELS_PER_SPEC):
-            start_pkt = class_idx * 16
-            data_views = []
-
-            # 批量收集字节块
-            for pkt_idx in range(16):
-                pkt = packets[start_pkt + pkt_idx]
-                sci_data = pkt.sci_data
-                for i in range(0, len(sci_data), BYTES_PER_VALUE):
-                    if i + BYTES_PER_VALUE <= len(sci_data):
-                        data_views.append(sci_data[i:i + BYTES_PER_VALUE])
-
-            # 批量转换
-            if data_views:
-                result[class_idx] = SciDataProcessor.bytes_to_int64_vec(data_views)
-
-        return result
+        # 一次性 join 全部 64 包（sci_data 已是 bytes，无需 bytes() 拷贝）
+        all_bytes = b''.join(pkt.sci_data for pkt in packets)
+        arr_u8 = np.frombuffer(all_bytes, dtype=np.uint8).reshape(
+            CHANNELS_PER_SPEC, VALUES_PER_CHANNEL, BYTES_PER_VALUE
+        )
+        # Bytes 1–8 编码 int64（|value| < 2^63 对射电天文 FFT 输出成立）
+        last8 = np.ascontiguousarray(arr_u8[:, :, 1:])   # (4, 4096, 8)
+        return last8.view(np.dtype('>i8')).reshape(CHANNELS_PER_SPEC, VALUES_PER_CHANNEL)
 
     @staticmethod
     def _read_signed48(data: bytes, offset: int) -> int:
@@ -494,8 +469,22 @@ class SciDataProcessor:
         return val
 
     @staticmethod
+    def _decode_signed48_block(raw_bytes: bytes, n_values: int) -> np.ndarray:
+        """Vectorized decode of n_values consecutive 6-byte big-endian signed48 values.
+
+        Strategy: place each 6-byte chunk at the MSB of an 8-byte buffer (zero-fill
+        the 2 LSB bytes), read as big-endian int64, arithmetic-right-shift 16 bits.
+        This gives correct sign extension for any 48-bit two's-complement value.
+        """
+        arr = np.frombuffer(raw_bytes, dtype=np.uint8).reshape(n_values, 6)
+        padded = np.zeros((n_values, 8), dtype=np.uint8)
+        padded[:, :6] = arr                                         # 6 bytes at MSB
+        vals = padded.view(np.dtype('>i8')).reshape(n_values)       # big-endian int64
+        return vals >> 16                                            # arithmetic right-shift
+
+    @staticmethod
     def process_vna_sweep(sweep_pkts: list) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """处理单次 VNA 扫频（由 group_flag 分组的多个包）
+        """处理单次 VNA 扫频（由 group_flag 分组的多个包）— numpy vectorized
 
         VNA 包科学数据域结构：
           [0:2]  计算请求总计数 (uint16)
@@ -509,30 +498,40 @@ class SciDataProcessor:
             s11:  S11 线性值 (复数), = (Irfl + j*Qrfl) / (Iref + j*Qref)
             iref, qref, irfl, qrfl: 原始 IQ 值 (int64)
         """
-        all_iref, all_qref, all_irfl, all_qrfl = [], [], [], []
-
+        freq_chunks = []
+        total_freq = 0
         for pkt in sweep_pkts:
             sd = pkt.sci_data
             n_freq = (pkt.valid_data_len - VNA_HEADER_SIZE) // VNA_FREQ_POINT_SIZE
+            if n_freq > 0:
+                end = VNA_HEADER_SIZE + n_freq * VNA_FREQ_POINT_SIZE
+                freq_chunks.append(bytes(sd[VNA_HEADER_SIZE:end]))
+                total_freq += n_freq
 
-            for fi in range(n_freq):
-                base = VNA_HEADER_SIZE + fi * VNA_FREQ_POINT_SIZE
-                all_iref.append(SciDataProcessor._read_signed48(sd, base))
-                all_qref.append(SciDataProcessor._read_signed48(sd, base + 6))
-                all_irfl.append(SciDataProcessor._read_signed48(sd, base + 12))
-                all_qrfl.append(SciDataProcessor._read_signed48(sd, base + 18))
+        if total_freq == 0:
+            empty = np.zeros(0, dtype=np.int64)
+            return np.zeros(0, dtype=complex), empty, empty, empty, empty
 
-        iref  = np.array(all_iref,  dtype=np.int64)
-        qref  = np.array(all_qref,  dtype=np.int64)
-        irfl  = np.array(all_irfl,  dtype=np.int64)
-        qrfl  = np.array(all_qrfl,  dtype=np.int64)
+        all_freq_bytes = b''.join(freq_chunks)
+        # Reshape to (total_freq, 4 IQ components, 6 bytes each)
+        raw = np.frombuffer(all_freq_bytes, dtype=np.uint8).reshape(total_freq, 4, 6)
 
-        # S11 = (Irfl + j*Qrfl) / (Iref + j*Qref)
+        # Vectorized 48-bit signed decode: put 6 bytes at MSB of 8-byte buffer
+        padded = np.zeros((total_freq, 4, 8), dtype=np.uint8)
+        padded[:, :, :6] = raw
+        vals = padded.view(np.dtype('>i8')).reshape(total_freq, 4) >> 16
+
+        iref = vals[:, 0]
+        qref = vals[:, 1]
+        irfl = vals[:, 2]
+        qrfl = vals[:, 3]
+
+        # S11 = conj((Irfl + j*Qrfl) / (Iref + j*Qref))
+        # 硬件 IQ 混频器输出约定为 I-jQ，取共轭修正相位符号
         incident   = iref.astype(np.float64) + 1j * qref.astype(np.float64)
         reflection = irfl.astype(np.float64) + 1j * qrfl.astype(np.float64)
-        # 避免除零
         with np.errstate(divide='ignore', invalid='ignore'):
-            s11 = np.where(np.abs(incident) > 0, reflection / incident, 0.0 + 0j)
+            s11 = np.where(np.abs(incident) > 0, np.conj(reflection / incident), 0.0 + 0j)
 
         return s11, iref, qref, irfl, qrfl
 
@@ -627,7 +626,6 @@ class SciDataProcessor:
 
             if (i + 1) % 1000 == 0:
                 logger.info(f"Processed {i + 1} specs")
-                gc.collect()
 
         return result
 
@@ -647,7 +645,7 @@ class SciDataProcessor:
 
     @staticmethod
     def process_all_temps(temp_pkts: list) -> np.ndarray:
-        """解码温度包，返回 (n_pkt, 5, 5) float64 温度数组 (℃)
+        """解码温度包，返回 (n_pkt, 5, 5) float64 温度数组 (℃) — numpy vectorized
 
         75 bytes/packet = 5 chips × 5 channels × 3 bytes (offset-binary 24-bit)
         R  = (code − 2²³) × Vref / (2²³ × PGA × Iio)
@@ -655,23 +653,45 @@ class SciDataProcessor:
         无效通道返回 NaN。
         """
         n = len(temp_pkts)
-        data = np.full((n, TEMP_N_CHIPS, TEMP_CH_PER_CHIP), np.nan, dtype=np.float64)
         sci_size = TEMP_N_CHIPS * TEMP_CH_PER_CHIP * 3  # 75 bytes
+        n_sensors = TEMP_N_CHIPS * TEMP_CH_PER_CHIP      # 25
 
-        scale = TEMP_VREF / ((1 << 23) * TEMP_PGA * TEMP_IIO)
-        offset_code = 1 << 23
+        scale       = TEMP_VREF / ((1 << 23) * TEMP_PGA * TEMP_IIO)
+        offset_code = float(1 << 23)
 
+        # Collect valid packets into a single flat buffer
+        raw_chunks: list[bytes] = []
+        valid_row = np.zeros(n, dtype=bool)
         for i, pkt in enumerate(temp_pkts):
             sd = pkt.sci_data
-            if len(sd) < sci_size:
-                continue
-            for chip in range(TEMP_N_CHIPS):
-                for ch in range(TEMP_CH_PER_CHIP):
-                    byte_idx = (chip * TEMP_CH_PER_CHIP + ch) * 3
-                    code = int.from_bytes(sd[byte_idx:byte_idx + 3], 'big')
-                    r = (code - offset_code) * scale
-                    data[i, chip, ch] = SciDataProcessor.pt1000_resistance_to_temp(r)
+            if len(sd) >= sci_size:
+                raw_chunks.append(bytes(sd[:sci_size]))
+                valid_row[i] = True
 
+        data = np.full((n, TEMP_N_CHIPS, TEMP_CH_PER_CHIP), np.nan, dtype=np.float64)
+        if not raw_chunks:
+            return data
+
+        m = len(raw_chunks)
+        # Stack into (m, n_sensors, 3) uint8, decode big-endian 24-bit unsigned
+        raw_all = np.frombuffer(b''.join(raw_chunks), dtype=np.uint8).reshape(m, n_sensors, 3)
+        codes = (raw_all[:, :, 0].astype(np.int64) << 16
+                 | raw_all[:, :, 1].astype(np.int64) << 8
+                 | raw_all[:, :, 2].astype(np.int64))
+
+        R = (codes.astype(np.float64) - offset_code) * scale
+
+        # Vectorized PT1000 CVD: NaN for out-of-range R or negative discriminant
+        R_ok   = (R >= 800.0) & (R <= 3000.0)
+        disc   = PT1000_A ** 2 - 4.0 * PT1000_B * (1.0 - R / PT1000_R0)
+        disc_ok = disc >= 0.0
+        ok     = R_ok & disc_ok
+
+        T = np.where(ok,
+                     (-PT1000_A + np.sqrt(np.where(ok, disc, 0.0))) / (2.0 * PT1000_B),
+                     np.nan)
+
+        data[valid_row] = T.reshape(m, TEMP_N_CHIPS, TEMP_CH_PER_CHIP)
         return data
 
 
@@ -709,34 +729,18 @@ class MetadataExtractor:
         """
         n = len(packets)
 
-        # 主字段
-        time_array  = np.empty(n, dtype=np.float64)
-        seq_count   = np.empty(n, dtype=np.uint16)
-        src_num_arr = np.empty(n, dtype=np.uint8)
-
-        # metadata — 包头完整字段，per-packet
-        app_id_arr      = np.empty(n, dtype=np.uint16)
-        version_arr     = np.empty(n, dtype=np.uint8)
-        pkt_type_arr    = np.empty(n, dtype=np.uint8)
-        sec_hdr_arr     = np.empty(n, dtype=np.uint8)
-        group_flag_arr  = np.empty(n, dtype=np.uint8)
-        data_len_arr    = np.empty(n, dtype=np.uint32)
-        valid_len_arr   = np.empty(n, dtype=np.uint32)
-        checksum_arr    = np.empty(n, dtype=np.uint16)
-
-        for i, pkt in enumerate(packets):
-            time_array[i]     = pkt.seconds + pkt.microseconds * 1e-6
-            seq_count[i]      = pkt.seq_count
-            src_num_arr[i]    = pkt.src_num
-
-            app_id_arr[i]     = pkt.app_id
-            version_arr[i]    = pkt.version
-            pkt_type_arr[i]   = pkt.pkt_type
-            sec_hdr_arr[i]    = pkt.sec_hdr_flag
-            group_flag_arr[i] = pkt.group_flag
-            data_len_arr[i]   = pkt.data_len
-            valid_len_arr[i]  = pkt.valid_data_len
-            checksum_arr[i]   = pkt.checksum
+        # 用列表推导代替逐包索引赋值（更快，避免 n 次 Python 属性查找 + 数组写入）
+        time_array     = np.array([pkt.seconds + pkt.microseconds * 1e-6 for pkt in packets], dtype=np.float64)
+        seq_count      = np.array([pkt.seq_count      for pkt in packets], dtype=np.uint16)
+        src_num_arr    = np.array([pkt.src_num        for pkt in packets], dtype=np.uint8)
+        app_id_arr     = np.array([pkt.app_id         for pkt in packets], dtype=np.uint16)
+        version_arr    = np.array([pkt.version        for pkt in packets], dtype=np.uint8)
+        pkt_type_arr   = np.array([pkt.pkt_type       for pkt in packets], dtype=np.uint8)
+        sec_hdr_arr    = np.array([pkt.sec_hdr_flag   for pkt in packets], dtype=np.uint8)
+        group_flag_arr = np.array([pkt.group_flag     for pkt in packets], dtype=np.uint8)
+        data_len_arr   = np.array([pkt.data_len       for pkt in packets], dtype=np.uint32)
+        valid_len_arr  = np.array([pkt.valid_data_len for pkt in packets], dtype=np.uint32)
+        checksum_arr   = np.array([pkt.checksum       for pkt in packets], dtype=np.uint16)
 
         primary = {
             'time': time_array,

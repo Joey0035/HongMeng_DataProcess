@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import data_manager
 import data_processor as dp
@@ -18,6 +18,12 @@ from config import TEMP_SENSOR_LABELS, TEMP_N_CHIPS, TEMP_CH_PER_CHIP
 from theme import apply_theme
 
 apply_theme()
+
+@st.cache_data
+def _cached_temp_stats(temp_data: np.ndarray, time_arr: np.ndarray,
+                       selected_indices: tuple, t_start: float, t_end: float) -> dict:
+    """cached wrapper — Streamlit 会对 numpy array 内容哈希，widget 改变时自动失效"""
+    return dp.compute_temp_statistics(temp_data, time_arr, list(selected_indices), t_start, t_end)
 
 st.title("Temperature Monitoring")
 
@@ -48,7 +54,8 @@ time_range = st.slider(
     min_value=t_min_dt,
     max_value=t_max_dt,
     value=(t_min_dt, t_max_dt),
-    format="HH:mm:ss",
+    format="MM/DD HH:mm",
+    step=timedelta(minutes=30),
 )
 
 t_start = time_range[0].timestamp()
@@ -96,14 +103,24 @@ selected_indices = [dp.label_to_chip_ch(lbl) for lbl in selected_labels]
 #  Statistics panel
 # ==============================================================
 
-stats = dp.compute_temp_statistics(temp_data, time_arr, selected_indices, t_start, t_end)
+stats = _cached_temp_stats(temp_data, time_arr, tuple(selected_indices), t_start, t_end)
 
 st.subheader("Statistics")
 stat_cols = st.columns(4)
+
+# Find which probe has the global max and min
+_pp = stats['per_point']
+_max_sensor = max(_pp, key=lambda k: _pp[k]['max']) if _pp else None
+_min_sensor = min(_pp, key=lambda k: _pp[k]['min']) if _pp else None
+
 with stat_cols[0]:
     st.metric("Global Max", f"{stats['global_max']:.1f} °C")
+    if _max_sensor:
+        st.caption(f"@ {_max_sensor}")
 with stat_cols[1]:
     st.metric("Global Min", f"{stats['global_min']:.1f} °C")
+    if _min_sensor:
+        st.caption(f"@ {_min_sensor}")
 with stat_cols[2]:
     if selected_indices:
         avg_fluct = np.nanmean([v['fluctuation'] for v in stats['per_point'].values()])
