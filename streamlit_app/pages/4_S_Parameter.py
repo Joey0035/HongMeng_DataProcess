@@ -15,9 +15,9 @@ import data_manager
 import data_processor as dp
 import plot_utils
 from config import (
-    CAL_SWITCH_PLANE, CAL_LNA_PLANE, CAL_LNA_CABLE_DEFAULTS,
+    CAL_SWITCH_PLANE, CAL_LNA_PLANE, CAL_LNA_CABLE_DEFAULTS, DEFAULT_VNA_FREQ,
 )
-from theme import apply_theme
+from theme import apply_theme, sidebar_colors, sidebar_label, sidebar_kv, sidebar_file_info
 
 apply_theme()
 
@@ -42,14 +42,28 @@ vna_freq_config = st.session_state.get('vna_freq_config', {})
 unique_nf = sorted(np.unique(vna['n_freq_per_sweep']).tolist())
 unique_nf = [int(x) for x in unique_nf]
 
-col_nf, col_time = st.columns([1, 3])
+col_nf, col_freq, col_time = st.columns([1, 2, 3])
 
 with col_nf:
     selected_nf = st.selectbox("Freq Points", unique_nf,
                                format_func=lambda x: f"{x} pts")
 
-# Get frequency axis
-freq_mhz = dp.get_vna_freq_mhz(selected_nf, vna_freq_config)
+# ── VNA Freq Config (inline, replaces sidebar widget) ────────────
+vna_cfg = st.session_state.get('vna_freq_config', dict(DEFAULT_VNA_FREQ))
+default_start, default_stop = vna_cfg.get(selected_nf, (0, 100))
+with col_freq:
+    _fc1, _fc2 = st.columns(2)
+    with _fc1:
+        f0 = st.number_input("Start (MHz)", value=float(default_start),
+                             key=f"vna_f0_{selected_nf}")
+    with _fc2:
+        f1 = st.number_input("Stop (MHz)", value=float(default_stop),
+                             key=f"vna_f1_{selected_nf}")
+vna_cfg[selected_nf] = (f0, f1)
+st.session_state['vna_freq_config'] = vna_cfg
+
+# Get frequency axis from the inline config
+freq_mhz = dp.get_vna_freq_mhz(selected_nf, vna_cfg)
 
 # Use pre-computed split (cached in session_state by store_in_session)
 _vna_splits = st.session_state.get('cache_vna_splits', {})
@@ -59,6 +73,7 @@ else:
     split_data, split_time = dp.split_vna_by_src_with_time(result, n_freq=selected_nf)
 src_names = list(split_data.keys())
 
+time_range = None
 with col_time:
     sweep_times = dp.get_vna_sweep_times(vna)
     if len(sweep_times) > 0:
@@ -90,53 +105,53 @@ cable_len = CAL_LNA_CABLE_DEFAULTS['length_m']
 cable_vf = CAL_LNA_CABLE_DEFAULTS['velocity_factor']
 cable_loss = CAL_LNA_CABLE_DEFAULTS['loss_db_per_m_per_ghz']
 
-with st.expander("OSL Calibration", expanded=False):
-    cal_enabled = st.toggle("Enable VNA Calibration", value=False, key="vna_cal_enabled")
+st.divider()
+st.caption("OSL CALIBRATION")
+_tog_col, _sw_col, _lna_col = st.columns([1, 2, 2])
+with _tog_col:
+    cal_enabled = st.toggle("OSL Cal", key="vna_cal_enabled")
 
-    if cal_enabled:
-        # Check calibration standards presence
-        missing_sw = [v for k, v in CAL_SWITCH_PLANE.items() if v not in split_data]
-        missing_lna = [v for k, v in CAL_LNA_PLANE.items() if v not in split_data]
-
+if cal_enabled:
+    missing_sw  = [v for k, v in CAL_SWITCH_PLANE.items() if v not in split_data]
+    missing_lna = [v for k, v in CAL_LNA_PLANE.items()    if v not in split_data]
+    with _sw_col:
         if missing_sw:
-            st.warning(f"Switch-plane standards missing: {', '.join(missing_sw)} — calibration unavailable")
+            st.warning(f"Switch: missing {', '.join(missing_sw)}")
         else:
-            st.success("Switch-plane standards: OK")
-
+            st.success("Switch standards: OK")
+    with _lna_col:
         if missing_lna:
-            st.info(f"LNA-plane standards missing: {', '.join(missing_lna)} — LNA calibration disabled")
+            st.info("LNA cal disabled (standards missing)")
         else:
-            st.success("LNA-plane standards: OK")
+            st.success("LNA standards: OK")
 
-        # Cable offset settings for LNA plane
-        st.markdown("**LNA Cable Offset**")
-        cable_mode = st.radio("Cable Model", ["Analytical", "SNP File"],
-                              horizontal=True, key="cable_mode")
-
-        if cable_mode == "Analytical":
-            col_len, col_vf, col_loss = st.columns(3)
-            with col_len:
-                cable_len = st.number_input("Length (m)",
-                    value=CAL_LNA_CABLE_DEFAULTS['length_m'],
-                    format="%.4f", key="cable_len")
-            with col_vf:
-                cable_vf = st.number_input("Velocity Factor",
-                    value=CAL_LNA_CABLE_DEFAULTS['velocity_factor'],
-                    format="%.3f", key="cable_vf")
-            with col_loss:
-                cable_loss = st.number_input("Loss (dB/m/GHz)",
-                    value=CAL_LNA_CABLE_DEFAULTS['loss_db_per_m_per_ghz'],
-                    format="%.3f", key="cable_loss")
-        else:
-            snp_upload = st.file_uploader("Upload .s1p/.s2p",
-                                          type=['s1p', 's2p'],
-                                          key="snp_upload")
-            if snp_upload is not None:
-                # Write to temp file for parsing
-                suffix = Path(snp_upload.name).suffix
-                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-                    tmp.write(snp_upload.read())
-                    snp_file_path = tmp.name
+    # Cable offset row
+    _cmode_col, _cparam1, _cparam2, _cparam3 = st.columns([1, 1, 1, 1])
+    with _cmode_col:
+        cable_mode = st.radio("Cable", ["Analytical", "SNP File"],
+                              key="cable_mode")
+    if cable_mode == "Analytical":
+        with _cparam1:
+            cable_len = st.number_input("Length (m)",
+                value=CAL_LNA_CABLE_DEFAULTS['length_m'],
+                format="%.4f", key="cable_len")
+        with _cparam2:
+            cable_vf = st.number_input("Velocity Factor",
+                value=CAL_LNA_CABLE_DEFAULTS['velocity_factor'],
+                format="%.3f", key="cable_vf")
+        with _cparam3:
+            cable_loss = st.number_input("Loss (dB/m/GHz)",
+                value=CAL_LNA_CABLE_DEFAULTS['loss_db_per_m_per_ghz'],
+                format="%.3f", key="cable_loss")
+    else:
+        snp_upload = st.file_uploader("Upload .s1p/.s2p",
+                                      type=['s1p', 's2p'],
+                                      key="snp_upload")
+        if snp_upload is not None:
+            suffix = Path(snp_upload.name).suffix
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                tmp.write(snp_upload.read())
+                snp_file_path = tmp.name
 
 # Apply calibration if enabled and standards available
 cal_diag = None
@@ -168,7 +183,8 @@ if cal_enabled and not missing_sw and freq_mhz is not None:
 #  Source selection: checkbox grid
 # ==============================================================
 
-st.markdown("**Source Selection**")
+st.divider()
+st.caption("SOURCE SELECTION")
 btn_col1, btn_col2, _ = st.columns([1, 1, 6])
 with btn_col1:
     select_all = st.button("Select All", key="vna_sel_all", use_container_width=True)
@@ -205,19 +221,22 @@ for name in src_names:
         st.session_state[state_key][name] = (
             False if cal_enabled and name in _cal_std_names else True
         )
-# Remove stale keys no longer in src_names (e.g., standards removed by calibration)
+# Remove stale keys no longer in src_names
 st.session_state[state_key] = {
     k: v for k, v in st.session_state[state_key].items() if k in src_names
 }
+# Pre-seed widget keys to avoid value-conflict warning
+for name in src_names:
+    _cb_k = f"{_cb_prefix}_{name}"
+    if _cb_k not in st.session_state:
+        st.session_state[_cb_k] = st.session_state[state_key].get(name, True)
 
 n_cols = min(6, len(src_names)) if src_names else 1
 grid_cols = st.columns(n_cols)
 for idx, name in enumerate(src_names):
     with grid_cols[idx % n_cols]:
-        st.session_state[state_key][name] = st.checkbox(
-            name, value=st.session_state[state_key].get(name, True),
-            key=f"{_cb_prefix}_{name}",
-        )
+        checked = st.checkbox(name, key=f"{_cb_prefix}_{name}")
+        st.session_state[state_key][name] = checked
 
 selected_sources = [name for name in src_names if st.session_state[state_key].get(name, False)]
 
@@ -227,6 +246,57 @@ filtered_time = {k: v for k, v in split_time.items() if k in selected_sources}
 # ==============================================================
 #  Tabs
 # ==============================================================
+
+
+# ==============================================================
+#  Sidebar
+# ==============================================================
+
+with st.sidebar:
+    _is_light_sb = st.toggle("Day Mode",
+                             value=(st.session_state['theme'] == 'light'),
+                             key="theme_toggle")
+    if (('light' if _is_light_sb else 'dark') != st.session_state['theme']):
+        st.session_state['theme'] = 'light' if _is_light_sb else 'dark'
+        st.rerun()
+
+    c = sidebar_colors()
+    sidebar_file_info(c)
+
+    st.divider()
+    sidebar_label("CURRENT VIEW", c)
+    sidebar_kv("Freq pts", f"{selected_nf}", c)
+    if freq_mhz is not None:
+        sidebar_kv("Range", f"{f0:.0f} → {f1:.0f} MHz", c)
+    sidebar_kv("Sources", f"{len(selected_sources)} / {len(src_names)}", c)
+    if time_range is not None:
+        sidebar_kv("Start", time_range[0].strftime("%Y-%m-%d %H:%M"), c)
+        sidebar_kv("End",   time_range[1].strftime("%Y-%m-%d %H:%M"), c)
+    _cal_txt = ("On — OK"           if (cal_enabled and not missing_sw) else
+                f"On — {len(missing_sw)} std missing" if cal_enabled else "Off")
+    _cal_col = (c["ok"] if (cal_enabled and not missing_sw) else
+                c["warn"] if cal_enabled else c["dim"])
+    sidebar_kv("Cal", _cal_txt, c, val_color=_cal_col)
+
+# ── Display settings ─────────────────────────────────────────────
+st.divider()
+_cmap_c1, _cmap_c2, _ = st.columns([1, 1, 4])
+with _cmap_c1:
+    st.selectbox(
+        "Mag Colormap",
+        plot_utils.COLORMAP_OPTIONS_MAG,
+        index=plot_utils.COLORMAP_OPTIONS_MAG.index(
+            st.session_state.get('global_colormap_mag', 'Inferno')),
+        key='global_colormap_mag',
+    )
+with _cmap_c2:
+    st.selectbox(
+        "Phase Colormap",
+        plot_utils.COLORMAP_OPTIONS_PHASE,
+        index=plot_utils.COLORMAP_OPTIONS_PHASE.index(
+            st.session_state.get('global_colormap_phase', 'RdBu')),
+        key='global_colormap_phase',
+    )
 
 tab_labels = ["|S11| Magnitude", "S11 Phase", "Waterfall", "Waterfall Array", "Smith Chart"]
 if cal_diag is not None:
@@ -273,15 +343,11 @@ with tabs[2]:
         wf_source = st.selectbox("Waterfall Source",
                                  selected_sources if selected_sources else src_names,
                                  key="vna_wf_source")
-        _wf_ctrl1, _wf_ctrl2 = st.columns([1, 2])
-        with _wf_ctrl1:
-            wf_mode = st.radio("Display", ["Magnitude (dB)", "Phase (deg)"],
-                               horizontal=True, key="vna_wf_mode")
-        with _wf_ctrl2:
-            _vna_wf_cmap_opts = (plot_utils.COLORMAP_OPTIONS_PHASE
-                                 if wf_mode == "Phase (deg)"
-                                 else plot_utils.COLORMAP_OPTIONS_MAG)
-            vna_wf_cmap = st.selectbox("Color Map", _vna_wf_cmap_opts, key="vna_wf_colormap")
+        wf_mode = st.radio("Display", ["Magnitude (dB)", "Phase (deg)"],
+                           horizontal=True, key="vna_wf_mode")
+        vna_wf_cmap = (st.session_state.get('global_colormap_phase', 'RdBu')
+                       if wf_mode == "Phase (deg)"
+                       else st.session_state.get('global_colormap_mag', 'Inferno'))
 
         if wf_source in split_data:
             data_src = split_data[wf_source]
@@ -333,10 +399,9 @@ with tabs[3]:
                                         key="vna_wf_array_per_page")
         vna_wf_mode = st.radio("Display", ["Magnitude (dB)", "Phase (deg)"],
                                horizontal=True, key="vna_wf_array_mode")
-        _vna_arr_cmap_opts = (plot_utils.COLORMAP_OPTIONS_PHASE
-                              if vna_wf_mode == "Phase (deg)"
-                              else plot_utils.COLORMAP_OPTIONS_MAG)
-        vna_arr_cmap = st.selectbox("Color Map", _vna_arr_cmap_opts, key="vna_wf_array_colormap")
+        vna_arr_cmap = (st.session_state.get('global_colormap_phase', 'RdBu')
+                        if vna_wf_mode == "Phase (deg)"
+                        else st.session_state.get('global_colormap_mag', 'Inferno'))
 
         wf_arr_data = {}
         wf_arr_times = {}

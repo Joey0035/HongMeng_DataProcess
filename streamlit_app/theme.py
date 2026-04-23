@@ -18,6 +18,12 @@ button[data-baseweb="tab"] { font-family: 'JetBrains Mono', monospace !important
 [data-testid="stAlert"] { border-radius: 6px; border-left-width: 4px; }
 .stCheckbox label span { font-size: 0.85rem; }
 [data-testid="stSlider"] { padding-top: 0.5rem; }
+/* ---- Section label chip ---- */
+.section-chip {
+    display: inline-block; padding: 2px 10px; border-radius: 4px;
+    font-size: 0.7rem; letter-spacing: 0.1em; font-weight: 700;
+    text-transform: uppercase; margin-bottom: 8px;
+}
 """
 
 # ==============================================================
@@ -129,15 +135,46 @@ button[data-baseweb="tab"][aria-selected="true"] { color: #00f0ff !important; }
 [data-testid="stSlider"] [data-testid="stTickBarMin"],
 [data-testid="stSlider"] [data-testid="stTickBarMax"] { color: #8899aa !important; }
 /* ---- Expander ---- */
-details summary, details summary span { color: #c8d6e5 !important; }
-details { border: 1px solid rgba(0,240,255,0.1) !important; border-radius: 6px; }
-details[open] { background-color: rgba(15,20,37,0.5) !important; }
+details {
+    border: 1px solid rgba(0,240,255,0.15) !important;
+    border-radius: 6px; margin-bottom: 4px;
+}
+details summary {
+    background: rgba(0,240,255,0.06) !important;
+    padding: 8px 12px !important; border-radius: 5px;
+    cursor: pointer;
+}
+details summary:hover { background: rgba(0,240,255,0.12) !important; }
+details[open] summary { border-radius: 5px 5px 0 0; }
+details[open] { background-color: rgba(10,16,32,0.6) !important; }
+details summary span, details summary p,
+[data-testid="stExpander"] summary span {
+    color: #c8d6e5 !important; font-weight: 500;
+}
 /* ---- DataFrame ---- */
 [data-testid="stDataFrame"] { border: 1px solid rgba(0,240,255,0.1); border-radius: 6px; }
 /* ---- Misc ---- */
 hr { border-color: rgba(0,240,255,0.1) !important; }
 /* ---- Alert ---- */
 [data-testid="stAlert"] p, [data-testid="stAlert"] span { color: inherit !important; }
+/* ---- Parse log terminal ---- */
+.parse-log-box {
+    background: #070b14; border: 1px solid rgba(0,240,255,0.12);
+    border-radius: 6px; padding: 10px 14px;
+    max-height: 420px; overflow-y: auto;
+    font-family: 'JetBrains Mono', monospace; font-size: 0.73rem; line-height: 1.65;
+}
+.parse-log-box .ll-INFO  { color: #64ffda; }
+.parse-log-box .ll-WARN  { color: #ffd166; }
+.parse-log-box .ll-ERROR { color: #ff6b6b; }
+.parse-log-box .ll-DEBUG { color: #556677; }
+/* ---- Status badge ---- */
+.linked-badge {
+    display:inline-block; padding:4px 10px; border-radius:4px;
+    background:rgba(100,255,218,0.1); border:1px solid rgba(100,255,218,0.3);
+    color:#64ffda !important; font-size:0.8rem; letter-spacing:0.06em;
+}
+.section-chip { background:rgba(0,240,255,0.08); color:#00f0ff !important; }
 """
 
 # ==============================================================
@@ -225,10 +262,22 @@ button[data-baseweb="tab"] { color: #4a5568 !important; }
 button[data-baseweb="tab"][aria-selected="true"] { color: #1a365d !important; }
 [data-baseweb="tab-highlight"] { background-color: #1f77b4 !important; }
 /* ---- Expander ---- */
-details summary, details summary span,
-[data-testid="stExpander"] summary span { color: #2d3748 !important; }
-details { border: 1px solid rgba(0,0,0,0.08) !important; border-radius: 6px; }
-details[open] { background-color: rgba(255,255,255,0.7) !important; }
+details {
+    border: 1px solid rgba(0,0,0,0.12) !important;
+    border-radius: 6px; margin-bottom: 4px;
+}
+details summary {
+    background: rgba(31,119,180,0.07) !important;
+    padding: 8px 12px !important; border-radius: 5px;
+    cursor: pointer;
+}
+details summary:hover { background: rgba(31,119,180,0.14) !important; }
+details[open] summary { border-radius: 5px 5px 0 0; }
+details[open] { background-color: rgba(255,255,255,0.85) !important; }
+details summary span, details summary p,
+[data-testid="stExpander"] summary span {
+    color: #1a365d !important; font-weight: 500;
+}
 /* ---- Metric cards ---- */
 [data-testid="stMetric"] {
     background: linear-gradient(135deg, rgba(31,119,180,0.05) 0%, rgba(255,255,255,0.95) 100%) !important;
@@ -279,6 +328,24 @@ hr { border-color: rgba(0,0,0,0.08) !important; }
 .stSpinner > div { color: #2b6cb0 !important; }
 /* ---- Plotly chart containers ---- */
 .stPlotlyChart { background-color: transparent !important; }
+/* ---- Parse log terminal ---- */
+.parse-log-box {
+    background: #f0f2f8; border: 1px solid rgba(0,0,0,0.1);
+    border-radius: 6px; padding: 10px 14px;
+    max-height: 420px; overflow-y: auto;
+    font-family: 'JetBrains Mono', monospace; font-size: 0.73rem; line-height: 1.65;
+}
+.parse-log-box .ll-INFO  { color: #1a6b3c; }
+.parse-log-box .ll-WARN  { color: #b45309; }
+.parse-log-box .ll-ERROR { color: #c53030; }
+.parse-log-box .ll-DEBUG { color: #94a3b8; }
+/* ---- Status badge ---- */
+.linked-badge {
+    display:inline-block; padding:4px 10px; border-radius:4px;
+    background:rgba(31,119,180,0.08); border:1px solid rgba(31,119,180,0.3);
+    color:#1a365d !important; font-size:0.8rem; letter-spacing:0.06em;
+}
+.section-chip { background:rgba(31,119,180,0.08); color:#1a365d !important; }
 """
 
 
@@ -299,3 +366,66 @@ def apply_theme():
         f"<style>{_GLOBAL_CSS}\n{theme_css}</style>",
         unsafe_allow_html=True,
     )
+
+
+# ==============================================================
+#  Sidebar helper utilities (shared across all pages)
+# ==============================================================
+
+def sidebar_colors() -> dict:
+    """Return a theme-aware color palette for sidebar custom HTML."""
+    dark = st.session_state.get('theme', 'dark') == 'dark'
+    return dict(
+        acc    = '#00f0ff' if dark else '#1a365d',
+        txt    = '#c8d6e5' if dark else '#2d3748',
+        dim    = '#8899aa' if dark else '#4a5568',
+        ok     = '#64ffda' if dark else '#276749',
+        warn   = '#ffd166' if dark else '#b7791f',
+        err    = '#ff6b6b' if dark else '#c53030',
+        bar_bg = 'rgba(255,255,255,0.08)' if dark else 'rgba(0,0,0,0.08)',
+    )
+
+
+def sidebar_label(text: str, c: dict = None):
+    """Render a styled uppercase section label inside a sidebar block."""
+    if c is None:
+        c = sidebar_colors()
+    st.markdown(
+        f'<div style="color:{c["acc"]}; font-size:0.68rem; letter-spacing:0.12em;'
+        f' font-weight:700; text-transform:uppercase; margin:6px 0 4px 0;">{text}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def sidebar_kv(key: str, val: str, c: dict = None, val_color: str = None):
+    """Render a key → value row inside a sidebar block."""
+    if c is None:
+        c = sidebar_colors()
+    vc = val_color if val_color else c['txt']
+    st.markdown(
+        f'<div style="display:flex; gap:8px; font-size:0.78rem; margin:2px 0;">'
+        f'<span style="color:{c["dim"]}; min-width:52px; flex-shrink:0;">{key}</span>'
+        f'<span style="color:{vc};">{val}</span></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def sidebar_file_info(c: dict = None):
+    """Render FILE section in sidebar if data is loaded. Returns True if rendered."""
+    import data_manager as _dm
+    if not _dm.is_data_loaded():
+        return False
+    if c is None:
+        c = sidebar_colors()
+    pi = _dm.get_parser_info()
+    st.divider()
+    sidebar_label("FILE", c)
+    st.markdown(
+        f'<div style="color:{c["txt"]}; font-size:0.82rem; font-weight:600;'
+        f' word-break:break-all; line-height:1.4;">{pi["filename"]}</div>'
+        f'<div style="color:{c["dim"]}; font-size:0.75rem; margin-top:3px;">'
+        f'{pi["file_size"]/1024**2:.1f} MB &nbsp;·&nbsp; {pi["total_packets"]:,} packets</div>',
+        unsafe_allow_html=True,
+    )
+    return True
+

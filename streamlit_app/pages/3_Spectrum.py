@@ -14,7 +14,7 @@ import data_manager
 import data_processor as dp
 import plot_utils
 from config import DTYPE_INDEX_MAP, DTYPE_LABELS, SOURCE_LABEL_MAP
-from theme import apply_theme
+from theme import apply_theme, sidebar_colors, sidebar_label, sidebar_kv, sidebar_file_info
 
 apply_theme()
 
@@ -59,11 +59,20 @@ src_names = list(split_data.keys())
 #  Controls
 # ==============================================================
 
-col_ctrl, col_time = st.columns([1, 2])
+col_ctrl, col_cmap, col_time = st.columns([1, 1, 3])
 
 with col_ctrl:
     channel_name = st.selectbox("Channel", DTYPE_LABELS)
     channel_idx = DTYPE_INDEX_MAP[channel_name]
+
+with col_cmap:
+    st.selectbox(
+        "Colormap",
+        plot_utils.COLORMAP_OPTIONS_MAG,
+        index=plot_utils.COLORMAP_OPTIONS_MAG.index(
+            st.session_state.get('global_colormap_mag', 'Inferno')),
+        key='global_colormap_mag',
+    )
 
 with col_time:
     fft_src, fft_time = dp.get_fft_src_time(spec)
@@ -83,7 +92,8 @@ t_start = time_range[0].timestamp()
 t_end = time_range[1].timestamp()
 
 # --- Source selection: checkbox grid ---
-st.markdown("**Source Selection**")
+st.divider()
+st.caption("SOURCE SELECTION")
 btn_col1, btn_col2, _ = st.columns([1, 1, 6])
 with btn_col1:
     select_all = st.button("Select All", key="spec_sel_all", use_container_width=True)
@@ -101,22 +111,23 @@ if deselect_all:
         st.session_state[f"spec_cb_{name}"] = False
     st.rerun()
 
-# Initialize: default all selected
+# Initialize state dict if absent
 if 'spec_src_state' not in st.session_state:
     st.session_state['spec_src_state'] = {name: True for name in src_names}
-# Sync if source list changed
 for name in src_names:
     if name not in st.session_state['spec_src_state']:
         st.session_state['spec_src_state'][name] = True
+    # Pre-seed the widget key so checkbox doesn't see a value conflict
+    _cb_key = f"spec_cb_{name}"
+    if _cb_key not in st.session_state:
+        st.session_state[_cb_key] = st.session_state['spec_src_state'][name]
 
 n_cols = min(6, len(src_names))
 grid_cols = st.columns(n_cols)
 for idx, name in enumerate(src_names):
     with grid_cols[idx % n_cols]:
-        st.session_state['spec_src_state'][name] = st.checkbox(
-            name, value=st.session_state['spec_src_state'].get(name, True),
-            key=f"spec_cb_{name}",
-        )
+        checked = st.checkbox(name, key=f"spec_cb_{name}")
+        st.session_state['spec_src_state'][name] = checked
 
 selected_sources = [name for name in src_names if st.session_state['spec_src_state'].get(name, False)]
 
@@ -125,8 +136,32 @@ filtered_split = {k: v for k, v in split_data.items() if k in selected_sources}
 filtered_time = {k: v for k, v in split_time.items() if k in selected_sources}
 
 # ==============================================================
+#  Sidebar
+# ==============================================================
+
+with st.sidebar:
+    _is_light_sb = st.toggle("Day Mode",
+                             value=(st.session_state['theme'] == 'light'),
+                             key="theme_toggle")
+    if (('light' if _is_light_sb else 'dark') != st.session_state['theme']):
+        st.session_state['theme'] = 'light' if _is_light_sb else 'dark'
+        st.rerun()
+
+    c = sidebar_colors()
+    sidebar_file_info(c)
+
+    st.divider()
+    sidebar_label("CURRENT VIEW", c)
+    sidebar_kv("Channel", channel_name, c)
+    sidebar_kv("Sources", f"{len(selected_sources)} / {len(src_names)}", c)
+    sidebar_kv("Start",   time_range[0].strftime("%Y-%m-%d %H:%M"), c)
+    sidebar_kv("End",     time_range[1].strftime("%Y-%m-%d %H:%M"), c)
+
+# ==============================================================
 #  Tabs
 # ==============================================================
+
+st.divider()
 
 tab1, tab2, tab3 = st.tabs(["1D Spectrum", "Waterfall", "Waterfall Array"])
 
@@ -142,13 +177,9 @@ with tab1:
 
 with tab2:
     if src_names:
-        _wf_c1, _wf_c2 = st.columns([3, 1])
-        with _wf_c1:
-            wf_source = st.selectbox("Waterfall Source", selected_sources if selected_sources else src_names,
-                                     key="wf_source")
-        with _wf_c2:
-            wf_cmap = st.selectbox("Color Map", plot_utils.COLORMAP_OPTIONS_MAG,
-                                   key="spec_wf_colormap")
+        wf_source = st.selectbox("Waterfall Source", selected_sources if selected_sources else src_names,
+                                 key="wf_source")
+        wf_cmap = st.session_state.get('global_colormap_mag', 'Inferno')
         if wf_source in split_data:
             data_src = split_data[wf_source]
             time_src = split_time[wf_source]
@@ -194,7 +225,7 @@ with tab3:
         _arr_def_hi = min(freq_max_val, 200.0)
         if _arr_def_lo >= _arr_def_hi:
             _arr_def_lo, _arr_def_hi = freq_min_val, freq_max_val
-        ctrl1, ctrl2, ctrl3, ctrl4 = st.columns([3, 1, 1, 1.5])
+        ctrl1, ctrl2, ctrl3 = st.columns([3, 1, 1])
         with ctrl1:
             spec_fr = st.slider(
                 "Frequency Range (MHz)", min_value=freq_min_val, max_value=freq_max_val,
@@ -206,9 +237,7 @@ with tab3:
         with ctrl3:
             per_page = st.select_slider("Sources/Page", options=[4, 6, 8, 12, 16], value=6,
                                         key="spec_wf_array_per_page")
-        with ctrl4:
-            arr_cmap = st.selectbox("Color Map", plot_utils.COLORMAP_OPTIONS_MAG,
-                                    key="spec_wf_array_colormap")
+        arr_cmap = st.session_state.get('global_colormap_mag', 'Inferno')
 
         # Prepare data: time-filter + channel select + downsample per source (cached)
         wf_array_data = {}

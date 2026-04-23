@@ -15,7 +15,7 @@ import data_manager
 import data_processor as dp
 import plot_utils
 from config import TEMP_SENSOR_LABELS, TEMP_N_CHIPS, TEMP_CH_PER_CHIP
-from theme import apply_theme
+from theme import apply_theme, sidebar_colors, sidebar_label, sidebar_kv, sidebar_file_info
 
 apply_theme()
 
@@ -40,29 +40,41 @@ temp = result['temp']
 temp_data = temp['data']   # (n_pkt, 5, 5)
 time_arr = temp['time']    # (n_pkt,)
 
-thresholds = st.session_state.get('temp_thresholds', {'high': 60.0, 'low': -10.0})
+thresholds = st.session_state.get('temp_thresholds', {'high': 100.0, 'low': -10.0})
 
 # ==============================================================
 #  Controls
 # ==============================================================
 
-# Time range
-t_min_dt = datetime.fromtimestamp(float(time_arr[0]))
-t_max_dt = datetime.fromtimestamp(float(time_arr[-1]))
-time_range = st.slider(
-    "Time Range",
-    min_value=t_min_dt,
-    max_value=t_max_dt,
-    value=(t_min_dt, t_max_dt),
-    format="MM/DD HH:mm",
-    step=timedelta(minutes=30),
-)
+# Controls: thresholds + time range in one compact row
+_th_c1, _th_c2, _tc_time = st.columns([1, 1, 4])
+with _th_c1:
+    th_high = st.number_input("High Limit (°C)", value=float(thresholds['high']),
+                               key="temp_th_high")
+with _th_c2:
+    th_low = st.number_input("Low Limit (°C)", value=float(thresholds['low']),
+                              key="temp_th_low")
+thresholds = {'high': th_high, 'low': th_low}
+st.session_state['temp_thresholds'] = thresholds
+
+with _tc_time:
+    t_min_dt = datetime.fromtimestamp(float(time_arr[0]))
+    t_max_dt = datetime.fromtimestamp(float(time_arr[-1]))
+    time_range = st.slider(
+        "Time Range",
+        min_value=t_min_dt,
+        max_value=t_max_dt,
+        value=(t_min_dt, t_max_dt),
+        format="MM/DD HH:mm",
+        step=timedelta(minutes=30),
+    )
 
 t_start = time_range[0].timestamp()
 t_end = time_range[1].timestamp()
 
 # --- Sensor selection: checkbox grid by chip ---
-st.markdown("**Sensor Selection**")
+st.divider()
+st.caption("SENSOR SELECTION")
 btn_col1, btn_col2, _ = st.columns([1, 1, 6])
 with btn_col1:
     select_all = st.button("Select All", key="temp_sel_all", use_container_width=True)
@@ -83,16 +95,20 @@ if deselect_all:
 if 'temp_src_state' not in st.session_state:
     st.session_state['temp_src_state'] = {lbl: True for lbl in TEMP_SENSOR_LABELS}
 
+# Pre-seed widget keys to avoid value-conflict warning
+for lbl in TEMP_SENSOR_LABELS:
+    _tk = f"temp_cb_{lbl}"
+    if _tk not in st.session_state:
+        st.session_state[_tk] = st.session_state['temp_src_state'].get(lbl, True)
+
 # Display as 5 columns (one per channel), 5 rows (one per chip)
 grid_cols = st.columns(TEMP_CH_PER_CHIP)
 for i in range(TEMP_N_CHIPS):
     for j in range(TEMP_CH_PER_CHIP):
         lbl = f"Chip{i}-Ch{j}"
         with grid_cols[j]:
-            st.session_state['temp_src_state'][lbl] = st.checkbox(
-                lbl, value=st.session_state['temp_src_state'].get(lbl, True),
-                key=f"temp_cb_{lbl}",
-            )
+            checked = st.checkbox(lbl, key=f"temp_cb_{lbl}")
+            st.session_state['temp_src_state'][lbl] = checked
 
 selected_labels = [lbl for lbl in TEMP_SENSOR_LABELS if st.session_state['temp_src_state'].get(lbl, False)]
 
@@ -105,7 +121,8 @@ selected_indices = [dp.label_to_chip_ch(lbl) for lbl in selected_labels]
 
 stats = _cached_temp_stats(temp_data, time_arr, tuple(selected_indices), t_start, t_end)
 
-st.subheader("Statistics")
+st.divider()
+st.caption("STATISTICS")
 stat_cols = st.columns(4)
 
 # Find which probe has the global max and min
@@ -158,10 +175,50 @@ if alerts:
             st.warning(f"**{label}**: Min temp {val:.1f}°C below threshold {thresholds['low']}°C")
 
 # ==============================================================
+#  Sidebar
+# ==============================================================
+
+with st.sidebar:
+    _is_light_sb = st.toggle("Day Mode",
+                             value=(st.session_state['theme'] == 'light'),
+                             key="theme_toggle")
+    if (('light' if _is_light_sb else 'dark') != st.session_state['theme']):
+        st.session_state['theme'] = 'light' if _is_light_sb else 'dark'
+        st.rerun()
+
+    c = sidebar_colors()
+    sidebar_file_info(c)
+
+    st.divider()
+    sidebar_label("CURRENT VIEW", c)
+    sidebar_kv("Start",   time_range[0].strftime("%Y-%m-%d %H:%M"), c)
+    sidebar_kv("End",     time_range[1].strftime("%Y-%m-%d %H:%M"), c)
+    sidebar_kv("Sensors", f"{len(selected_indices)} / {len(TEMP_SENSOR_LABELS)}", c)
+
+    if stats and stats.get('per_point'):
+        st.divider()
+        sidebar_label("QUICK STATS", c)
+        sidebar_kv("Max", f"{stats['global_max']:.1f} °C", c)
+        sidebar_kv("Min", f"{stats['global_min']:.1f} °C", c)
+        if alerts:
+            st.markdown(
+                f'<div style="color:{c["err"]}; font-size:0.78rem; margin-top:4px;">'
+                f'{len(alerts)} alert{"s" if len(alerts) > 1 else ""} active</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                f'<div style="color:{c["ok"]}; font-size:0.78rem; margin-top:4px;">'
+                f'No alerts</div>',
+                unsafe_allow_html=True,
+            )
+
+# ==============================================================
 #  Temperature time series chart
 # ==============================================================
 
 if selected_labels:
+    st.divider()
     # Filter by time range
     mask = (time_arr >= t_start) & (time_arr <= t_end)
     filtered_data = temp_data[mask]

@@ -5,6 +5,9 @@ This is the ONLY module that imports from the parent-directory parser.
 
 import sys
 import time
+import logging
+import threading
+import queue as _queue_mod
 import tempfile
 from pathlib import Path
 
@@ -19,31 +22,64 @@ from HongMeng_raw_data_Parser import HongMengFileProcessor  # noqa: E402
 import data_processor as dp
 from config import STREAM_THRESHOLD, CHUNK_SIZE
 
+_PARSER_LOGGER = 'HongMeng_raw_data_Parser'
+
+
+# ==============================================================
+#  Log handlers
+# ==============================================================
+
+class _ListHandler(logging.Handler):
+    """Capture log records into a list (synchronous use)."""
+    def __init__(self):
+        super().__init__()
+        self.lines: list = []
+
+    def emit(self, record):
+        self.lines.append((record.levelname, self.format(record)))
+
+
+class _QueueHandler(logging.Handler):
+    """Push log records into a Queue (async/threaded use)."""
+    def __init__(self, q: _queue_mod.Queue):
+        super().__init__()
+        self.q = q
+
+    def emit(self, record):
+        self.q.put((record.levelname, self.format(record)))
+
+
+# ==============================================================
+#  Core parser runner
+# ==============================================================
 
 def _run_parser(file_path: str, file_name: str, file_size: int,
-                progress_placeholder=None, chunk_size: int = CHUNK_SIZE) -> tuple:
-    """Shared parser logic for both upload and local path modes.
+                chunk_size: int = CHUNK_SIZE,
+                log_handler: logging.Handler = None) -> tuple:
+    """Run the parser with an optional log handler.
 
-    Uses streaming mode automatically for large files (>= STREAM_THRESHOLD).
+    If log_handler is None, a _ListHandler is created and its lines are
+    stored in parser_info['parse_log_lines'].
+    If a _QueueHandler is passed (async mode), parse_log_lines will be []
+    — the caller accumulates lines from the queue independently.
     """
     t0 = time.time()
+    processor = HongMengFileProcessor(verbose=True)
 
-    processor = HongMengFileProcessor(verbose=False)
-
-    if progress_placeholder is not None:
-        progress_placeholder.info(
-            f"Parsing {file_name} ({file_size / 1024 / 1024:.1f} MB)..."
-            + (" [streaming mode]" if file_size >= STREAM_THRESHOLD else "")
+    _handler = log_handler if log_handler is not None else _ListHandler()
+    _handler.setFormatter(logging.Formatter('%(message)s'))
+    _plogger = logging.getLogger(_PARSER_LOGGER)
+    _plogger.addHandler(_handler)
+    try:
+        result = processor.process_file(
+            file_path,
+            chunk_size=chunk_size,
+            stream_threshold=STREAM_THRESHOLD,
         )
+    finally:
+        _plogger.removeHandler(_handler)
 
-    result = processor.process_file(
-        file_path,
-        chunk_size=chunk_size,
-        stream_threshold=STREAM_THRESHOLD,
-    )
     parse_time = time.time() - t0
-
-    # Run anomaly detection (staticmethod, read-only on result)
     anomalies = HongMengFileProcessor._detect_anomalies(result)
 
     parser_info = {
@@ -55,33 +91,70 @@ def _run_parser(file_path: str, file_name: str, file_size: int,
         'dropped_records': list(processor.parser.dropped_records),
         'anomalies': anomalies,
         'total_packets': sum(processor.parser.type_counts.values()),
+        # Populated only for sync _ListHandler; async caller fills this from queue
+        'parse_log_lines': getattr(_handler, 'lines', []),
     }
     return result, parser_info
 
 
-def parse_uploaded_file(uploaded_file, progress_placeholder=None,
-                        chunk_size: int = CHUNK_SIZE) -> tuple:
-    """Parse an uploaded .dat file.
+# ==============================================================
+#  Async parse (background thread + queue)
+# ==============================================================
 
-    Writes uploaded data to a temp file in chunks to avoid doubling memory,
-    then delegates to the parser (which uses streaming for large files).
+def parse_file_path_async(file_path: str,
+                          chunk_size: int = CHUNK_SIZE) -> tuple:
+    """Start parsing a .dat file in a background thread.
+
+    Returns (thread, log_queue, result_holder).
+    - log_queue: yields (levelname, message) tuples; sentinel None when done
+    - result_holder: dict populated on completion:
+        success=True  → keys: result, parser_info
+        success=False → keys: error, traceback
     """
-    # Write to temp file in chunks to avoid holding entire file twice in memory
+    p = Path(file_path)
+    log_queue: _queue_mod.Queue = _queue_mod.Queue()
+    result_holder: dict = {}
+
+    def _worker():
+        q_handler = _QueueHandler(log_queue)
+        try:
+            result, parser_info = _run_parser(
+                file_path, p.name, p.stat().st_size,
+                chunk_size=chunk_size, log_handler=q_handler,
+            )
+            parser_info['parse_log_lines'] = []  # filled by caller from queue
+            result_holder.update({'success': True, 'result': result,
+                                   'parser_info': parser_info})
+        except Exception as e:
+            import traceback as _tb
+            result_holder.update({'success': False, 'error': str(e),
+                                   'traceback': _tb.format_exc()})
+        finally:
+            log_queue.put(None)  # sentinel: parsing is finished
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    return t, log_queue, result_holder
+
+
+# ==============================================================
+#  Sync helpers (kept for non-dat / small paths)
+# ==============================================================
+
+def parse_uploaded_file(uploaded_file, chunk_size: int = CHUNK_SIZE) -> tuple:
+    """Parse an uploaded .dat file (synchronous)."""
     with tempfile.NamedTemporaryFile(suffix='.dat', delete=False) as tmp:
         tmp_path = tmp.name
-        # Write in 8-MB chunks rather than getvalue() all at once
         chunk = uploaded_file.read(8 * 1024 * 1024)
         while chunk:
             tmp.write(chunk)
             chunk = uploaded_file.read(8 * 1024 * 1024)
-
     try:
         result, parser_info = _run_parser(
             tmp_path, uploaded_file.name, uploaded_file.size,
-            progress_placeholder, chunk_size=chunk_size,
+            chunk_size=chunk_size,
         )
     finally:
-        # Clean up temp file and log
         try:
             Path(tmp_path).unlink()
             log_path = Path(tmp_path).with_name(Path(tmp_path).stem + '_parse.log')
@@ -89,27 +162,23 @@ def parse_uploaded_file(uploaded_file, progress_placeholder=None,
                 log_path.unlink()
         except OSError:
             pass
-
     return result, parser_info
 
 
+def parse_file_path(file_path: str, progress_placeholder=None,
+                    chunk_size: int = CHUNK_SIZE) -> tuple:
+    """Parse a .dat file from a local path (synchronous)."""
+    p = Path(file_path)
+    return _run_parser(file_path, p.name, p.stat().st_size, chunk_size=chunk_size)
+
+
 def load_npz_file(npz_path: str, progress_placeholder=None) -> tuple:
-    """Load a pre-processed .npz (produced by dat_to_npz.py) and reconstruct
-    the result dict + parser_info that the rest of the app expects.
-    """
+    """Load a pre-processed .npz and reconstruct result + parser_info."""
     p = Path(npz_path)
     if not p.exists():
         raise FileNotFoundError(f"NPZ file not found: {p}")
 
     t0 = time.time()
-    if progress_placeholder is not None:
-        progress_placeholder.info(f"Loading {p.name} ({p.stat().st_size / 1024**2:.1f} MB)...")
-
-    # allow_pickle=True is required: spec_raw / temp_raw are stored as object
-    # arrays of bytes.  Only load .npz files produced by this project's own
-    # parser (dat_to_npz.py / HongMengFileProcessor.process_file).  Do NOT
-    # extend this path to accept arbitrary user-uploaded .npz files — pickle
-    # deserialization of untrusted data enables arbitrary code execution.
     npz = np.load(str(p), allow_pickle=True, mmap_mode='r')
     keys = set(npz.files)
 
@@ -118,47 +187,30 @@ def load_npz_file(npz_path: str, progress_placeholder=None) -> tuple:
         type_keys = [k for k in keys if k.startswith(f'{type_key}_')]
         if not type_keys:
             continue
-
         sub: dict = {}
         metadata: dict = {}
         raw: dict = {}
-
         for k in sorted(type_keys):
             v = npz[k]
-            # 0-d object arrays (scalars saved via allow_pickle) → unwrap
             if v.ndim == 0:
                 v = v.item()
-
             if k.startswith(f'{type_key}_meta_'):
-                field = k[len(f'{type_key}_meta_'):]
-                metadata[field] = v
+                metadata[k[len(f'{type_key}_meta_'):]] = v
             elif k.startswith(f'{type_key}_raw_'):
-                field = k[len(f'{type_key}_raw_'):]
-                raw[field] = v
+                raw[k[len(f'{type_key}_raw_'):]] = v
             else:
-                field = k[len(f'{type_key}_'):]
-                sub[field] = v
-
+                sub[k[len(f'{type_key}_'):]] = v
         if metadata:
             sub['metadata'] = metadata
-        # VNA raw is a dict; SPEC/TEMP raw is an object array (may be absent if
-        # the parser skipped object-dtype fields — that's fine, app doesn't need it)
         if raw:
             sub['raw'] = raw
         elif 'raw' not in sub:
             sub['raw'] = np.array([], dtype=object)
-
         result[type_key] = sub
 
     load_time = time.time() - t0
-
-    # Reconstruct type_counts from the time arrays (one entry per packet)
-    type_counts = {}
-    for k in ('spec', 'vna', 'temp'):
-        if k in result:
-            time_arr = result[k].get('time', np.array([]))
-            type_counts[k.upper()] = int(len(time_arr))
-
+    type_counts = {k.upper(): int(len(result[k].get('time', [])))
+                   for k in ('spec', 'vna', 'temp') if k in result}
     parser_info = {
         'filename': p.name,
         'file_size': p.stat().st_size,
@@ -168,30 +220,23 @@ def load_npz_file(npz_path: str, progress_placeholder=None) -> tuple:
         'dropped_records': [],
         'anomalies': {},
         'total_packets': sum(type_counts.values()),
+        'parse_log_lines': [(
+            'INFO', f'Loaded {p.name} ({p.stat().st_size / 1024**2:.1f} MB) in {load_time:.2f}s'
+        )],
     }
     return result, parser_info
 
 
-def parse_file_path(file_path: str, progress_placeholder=None,
-                    chunk_size: int = CHUNK_SIZE) -> tuple:
-    """Parse a .dat file from a local path."""
-    p = Path(file_path)
-    result, parser_info = _run_parser(
-        file_path, p.name, p.stat().st_size,
-        progress_placeholder, chunk_size=chunk_size,
-    )
-    return result, parser_info
-
+# ==============================================================
+#  Session state helpers
+# ==============================================================
 
 def store_in_session(result: dict, parser_info: dict):
-    """Store parsed data and diagnostics in session_state.
-    Also pre-computes source splits so pages don't recompute on every widget interaction.
-    """
+    """Store parsed data in session_state and pre-compute source splits."""
     st.session_state['parsed_result'] = result
     st.session_state['parser_info'] = parser_info
     st.session_state['data_loaded'] = True
 
-    # Compute time range across all types
     all_times = []
     for key in ('spec', 'vna', 'temp'):
         if key in result:
@@ -202,7 +247,6 @@ def store_in_session(result: dict, parser_info: dict):
         combined = np.concatenate(all_times)
         st.session_state['time_range'] = (float(combined.min()), float(combined.max()))
 
-    # Pre-compute source splits — eliminates recomputation on every widget interaction
     try:
         if 'spec' in result:
             st.session_state['cache_spec_split'] = dp.split_spec_by_src_with_time(result)
@@ -218,20 +262,15 @@ def store_in_session(result: dict, parser_info: dict):
         else:
             st.session_state.pop('cache_vna_splits', None)
     except Exception:
-        pass  # splits computed on demand in pages if pre-computation fails
+        pass
 
-    # Clear derived caches
     for k in list(st.session_state.keys()):
         if k.startswith('cache_') and k not in ('cache_spec_split', 'cache_vna_splits'):
             del st.session_state[k]
 
 
 def scan_npz_directory(dir_path: str) -> list:
-    """Return metadata for every .npz file in *dir_path*, newest-first.
-
-    Each entry: {name, path, size_mb, mtime_str}
-    Returns an empty list when the directory is missing or contains no NPZ files.
-    """
+    """Return metadata for every .npz file in dir_path, newest-first."""
     d = Path(dir_path)
     if not d.is_dir():
         return []
@@ -241,9 +280,9 @@ def scan_npz_directory(dir_path: str) -> list:
         stat = p.stat()
         from datetime import datetime
         out.append({
-            'name':     p.name,
-            'path':     str(p),
-            'size_mb':  stat.st_size / 1024 ** 2,
+            'name':      p.name,
+            'path':      str(p),
+            'size_mb':   stat.st_size / 1024 ** 2,
             'mtime_str': datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M'),
         })
     return out
