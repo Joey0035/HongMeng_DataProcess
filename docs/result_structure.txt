@@ -140,7 +140,7 @@ result = process_file(file_path) 返回一个 dict，按数据类型分为三个
 
   注意：
   - 75 bytes/packet = 5 chips × 5 channels × 3 bytes (offset-binary 24-bit ADC code)
-  - R = (code − 2²³) × Vref / (2²³ × PGA × Iio)，Vref=2.5V，PGA=1，Iio=0.5mA
+  - R = (code − 2²³) × Vref / (2²³ × PGA × Iio)，Vref=2.5V，PGA=2，Iio=0.5mA
   - T = (−A + √(A²−4B(1−R/R₀))) / (2B)，A=3.9083e-3，B=−5.775e-7，R₀=1000Ω
   - R ∉ [800, 3000] Ω 时返回 NaN（传感器异常/未接入）
 

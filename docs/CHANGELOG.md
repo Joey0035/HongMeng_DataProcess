@@ -2,13 +2,63 @@
 
 > 核心逻辑是按版本号和日期组织，并将改动分为固定的几个类别：Added (新增), Changed (修改), Deprecated (弃用), Removed (移除), Fixed (修复), Security (安全)。
 
-## [Unreleased] (尚未发布的开发中功能)
-### Added
-- 针对天线阵列站点的温度监控 Streamlit 面板。
-- 温度超过阈值时的 UI 红色报警提示。
+## [Unreleased]
 
-### Changed
-- 将接收机动态范围的计算基准调整为 28MHz 频段。
+## [HongMeng DataProcess Tools 4.0.0] - 2026-04-23
+
+### Added — 新模块
+
+- **`HongMeng_VNA_Calibrator.py`**：VNA OSL（Open/Short/Load）1-port 3-term 误差模型校准引擎
+  - `Keysight85033E`：Keysight 85033E 校准件标准模型，计算 Γ_open / Γ_short / Γ_load（含偏置延迟、fringing C / parasitic L 多项式模型）
+  - `CableOffset`：RF 电缆 de-embedding 模型，支持解析传输线模型和 SNP 文件直接导入（`.s1p` / `.s2p`）
+  - `solve_osl_error_terms()`：向量化 OSL 3-term 线性方程组求解（vectorized `np.linalg.solve`，含条件数预警）
+  - `apply_osl_correction()`：1-port 误差修正，支持 `(n_freq,)` 和 `(n_sweep, n_freq)` 广播
+  - `calibrate_vna_data()`：高层校准编排——逐周期独立定标、双校准平面（12-port 开关面 + LNA 面）、标准件自校核（quality check）
+  - `read_touchstone()`：最小化 Touchstone `.s1p` / `.s2p` 解析器，支持 MA / RI / DB 格式
+
+- **`streamlit_app/`**：完整 Streamlit 数据监视平台（`streamlit run app.py`）
+  - **Page 1 — Packet Status**：SPEC / VNA / TEMP 包计数与占比、时间戳连续性图、seq_count 丢包统计
+  - **Page 2 — Temperature**：5 × 5 传感器矩阵热图、时间序列曲线、超阈值红色告警、可配置告警阈值
+  - **Page 3 — Spectrum**：SPEC 频谱按源分割，首次 / 均值折线图 + 瀑布图；支持时间范围过滤和通道选择（Auto1 / Auto2 / Cross-Real / Cross-Imag）
+  - **Page 4 — S-Parameter**：VNA S11 按源分割，首次 / 均值折线图 + 瀑布图 + Smith 圆图；集成 OSL 校准，支持上传 SNP 文件做 cable de-embedding
+  - 共享 `theme.py` CSS 主题，支持日间 / 夜间模式切换（sidebar toggle）
+  - `data_manager.py`：全局数据缓存，支持直接上传 `.dat` 或加载 `.npz`，`mmap_mode='r'` 按需加载
+  - `config.py`：可配置默认 VNA 频率范围、温度告警阈值、校准源名称
+
+- **`dat_to_npz.py`**：命令行批量转换工具——将大 `.dat` 文件解包并保存为 `.npz`，适用于超过浏览器上传限制（>200 MB）的离线预处理场景
+
+### Added — 解包器 (`HongMeng_raw_data_Parser.py`)
+
+- `valid_data_len` 偏离预期值时输出 WARNING（VNA 不做检查，因频点数本来可变）
+- 首包前跳过字节（leading incomplete data）记录到 `_parse.log` 和 `dropped_records`
+- 尾部不完整数据（trailing incomplete packet）同样记录到日志
+
+### Fixed
+
+- **TEMP_PGA 值错误**：`TEMP_PGA` 从 `1` 修正为 `2`（对应 AD7124 PGA=2 设置），影响 PT1000 电阻计算结果及温度精度
+
+### Changed — 性能优化 (2026-04-23)
+
+详细说明见 [`docs/性能优化说明.md`](性能优化说明.md)。
+
+| 位置 | 优化点 | 效果 |
+|------|--------|------|
+| `HongMeng_raw_data_Parser.py` | 流式缓冲从 `bytes +=` 改为 `bytearray.extend()` | 大文件内存分配 O(n²) → O(1) |
+| 同上 | 同步字扫描改用 `buf.find()`（C 速 Boyer-Moore-Horspool） | 噪声包跳过速度提升 10×+ |
+| 同上 | 校验和切片零拷贝（直接传 `memoryview` 切片） | 每包省去 ~2 KB 内存复制 |
+| 同上 | SPEC 块解码：单次 `b''.join` + `reshape` + `.view('>i8')` | SPEC 块解码速度提升 3–5× |
+| 同上 | 元数据提取改用列表推导式，移除热路径 `gc.collect()` | 消除预分配开销，减少 GC 延迟 |
+| `streamlit_app/data_manager.py` | NPZ 以 `mmap_mode='r'` 加载 | 大文件初始加载时间和内存峰值显著降低 |
+| `streamlit_app/data_processor.py` | 时间戳格式化改用 pandas 向量化 | 时间标签生成速度提升 20–100× |
+| `streamlit_app/pages/2_Temperature.py` | `@st.cache_data` 缓存温度统计 | 参数不变时跳过重复统计计算 |
+| `streamlit_app/pages/3_Spectrum.py` | `@st.cache_data` 缓存瀑布图预处理 | 切换通道 / 翻页时只重算变化信源 |
+| `streamlit_app/plot_utils.py` | Smith 圆图改用 `go.Scattergl` + `customdata/hovertemplate` | 渲染速度提升 5–10×，hover 生成移至客户端 |
+| 同上 | 瀑布图 `coloraxis` 配置批量 `update_layout` | N 次状态更新合并为 1 次 |
+| `streamlit_app/pages/4_S_Parameter.py` | 预计算校准标准均值，SNP 临时文件 `try/finally` 清理 | 消除重复均值计算，防止文件泄漏 |
+
+### Changed — 其他
+
+- `theme.py` 从各页面内联样式提取为共享模块，修复全部页面日间模式显示异常
 
 ## [HongMeng_raw_data_Parser 3.4.0] - 2026-04-08
 ### Added

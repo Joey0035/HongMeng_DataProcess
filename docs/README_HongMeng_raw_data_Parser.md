@@ -4,7 +4,7 @@
 
 `HongMeng_raw_data_Parser.py` — DSL 高频频谱仪原始 `.dat` 数据解包与处理程序。
 
-**版本**: v3.4 | **作者**: JoeyXu | **日期**: 2026-04-08
+**版本**: v4.0 | **作者**: JoeyXu | **日期**: 2026-04-23
 
 ---
 
@@ -43,6 +43,16 @@ temp_raw = result['temp']['raw']             # (n_pkt,) bytes
 ```bash
 python HongMeng_raw_data_Parser.py <file_path> [skip_pkt] [save]
 ```
+
+---
+
+## 相关模块
+
+| 模块 | 说明 |
+| ---- | ---- |
+| `HongMeng_DataInspector.py` | `EffectiveDataExtractor` / `DataInspector`：按源分割、打印概览、绘制频谱/S11面板 |
+| `HongMeng_VNA_Calibrator.py` | VNA OSL 校准引擎：误差项求解、修正、cable de-embedding |
+| `dat_to_npz.py` | 命令行批量转换：`.dat` → `.npz` |
 
 ---
 
@@ -105,6 +115,7 @@ result
 
 | 版本 | 日期 | 主要变更 |
 | ---- | ---- | -------- |
+| v4.0 | 2026-04-23 | 解包器全面性能优化、TEMP_PGA 修正(1→2)、VNA Calibrator、Streamlit 监视平台、dat_to_npz |
 | v3.4 | 2026-04-08 | 不完整包处理、伪同步码防御、异常数据检测、DataInspector 独立模块 |
 | v3.3 | 2026-04-07 | TEMP 温度解码（CVD）、obs_seq 观测序列还原 |
 | v3.2 | 2026-04-03 | VNA S参数解码、解包日志、result 结构重构、多 bug 修复 |

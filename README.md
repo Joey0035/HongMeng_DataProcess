@@ -1,4 +1,4 @@
-# HongMeng Data Process Tools
+# HongMeng Data Process Tools — v4.0
 
 鸿蒙计划高频频谱仪数据处理工具集。
 
@@ -7,10 +7,16 @@
 | 文件 | 说明 |
 | ---- | ---- |
 | `HongMeng_raw_data_Parser.py` | 原始数据解析器 — 支持 SPEC/VNA/TEMP 三种数据类型解包 |
-| `HongMeng_Preprocessor.py` | 数据预处理（开关矩阵标定等）【开发中】|
-| `Calibration_tools.py` | 校准工具函数库 |
+| `HongMeng_DataInspector.py` | 数据检视工具 — `EffectiveDataExtractor` / `DataInspector`：按源分割、打印概览、绘制频谱/S11面板 |
+| `HongMeng_VNA_Calibrator.py` | VNA OSL 校准引擎 — 1-port 3-term 误差模型，支持开关面/LNA面双校准平面 |
+| `HongMeng_Preprocessor.py` | 数据预处理（按观测序列分割等）|
+| `dat_to_npz.py` | 命令行批量转换工具 — 将超大 `.dat` 文件解包并保存为 `.npz` |
+| `streamlit_app/` | Streamlit 数据监视平台 — 包数据状态 / 温度 / 频谱 / S参数四个页面 |
+| `Calibration_tools.py` | 校准工具函数库（旧版） |
 
 ## 快速开始
+
+### 解析原始数据
 
 ```python
 from HongMeng_raw_data_Parser import HongMengFileProcessor
@@ -23,12 +29,53 @@ spec_data = result['spec']['data']           # (n_fft, 4, 4096) int64
 
 # VNA S参数
 s11 = result['vna']['data'][0]              # 第 0 次扫频 S11 复数值
-mag_dB = 20 * np.log10(np.abs(s11))          # |S11| in dB
-iref = result['vna']['raw']['iref'][0]      # 第 0 次扫频入射 I
+mag_dB = 20 * np.log10(np.abs(s11))         # |S11| in dB
 
 # 温度 (5 chips × 5 channels)
 temp_data = result['temp']['data']          # (n_pkt, 5, 5) float64, ℃
 obs_seq   = result['spec']['obs_seq']       # 检测到的观测序列，如 [30,31,...,45,23]
+```
+
+### 数据检视
+
+```python
+from HongMeng_DataInspector import DataInspector
+
+insp = DataInspector(result, vna_freq={901: (30, 120), 1901: (1, 190)})
+insp.info()                          # 打印数据概览
+insp.plot_spec_panel('1')            # SPEC 频谱面板（Auto1）
+insp.plot_vna_panel(n_freq=901)      # VNA S11 面板（901点扫频）
+```
+
+### VNA OSL 校准
+
+```python
+from HongMeng_DataInspector import DataInspector
+from HongMeng_VNA_Calibrator import calibrate_vna_data
+import numpy as np
+
+insp = DataInspector(result, vna_freq={901: (30, 120)})
+split = insp.split_vna_by_src(n_freq=901)
+freq_hz = np.linspace(30e6, 120e6, 901)
+
+calibrated, diagnostics = calibrate_vna_data(split, freq_hz)
+```
+
+### 命令行转换
+
+```bash
+# 解包 .dat 并保存为 .npz
+python dat_to_npz.py /data/obs_20260401.dat
+
+# 指定输出路径
+python dat_to_npz.py /data/obs_20260401.dat /out/obs.npz
+```
+
+### 启动 Streamlit 监视平台
+
+```bash
+cd streamlit_app
+streamlit run app.py
 ```
 
 ## 文档
@@ -42,3 +89,5 @@ obs_seq   = result['spec']['obs_seq']       # 检测到的观测序列，如 [30
 
 - Python 3.9+
 - numpy >= 1.20.0
+- matplotlib
+- streamlit（仅 `streamlit_app/` 需要，见 `streamlit_app/requirements.txt`）

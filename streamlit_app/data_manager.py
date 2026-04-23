@@ -105,6 +105,11 @@ def load_npz_file(npz_path: str, progress_placeholder=None) -> tuple:
     if progress_placeholder is not None:
         progress_placeholder.info(f"Loading {p.name} ({p.stat().st_size / 1024**2:.1f} MB)...")
 
+    # allow_pickle=True is required: spec_raw / temp_raw are stored as object
+    # arrays of bytes.  Only load .npz files produced by this project's own
+    # parser (dat_to_npz.py / HongMengFileProcessor.process_file).  Do NOT
+    # extend this path to accept arbitrary user-uploaded .npz files — pickle
+    # deserialization of untrusted data enables arbitrary code execution.
     npz = np.load(str(p), allow_pickle=True, mmap_mode='r')
     keys = set(npz.files)
 
