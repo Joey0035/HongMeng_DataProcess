@@ -29,15 +29,15 @@ KEYSIGHT_85033E = {
         'C0': 49.433e-15,       # F
         'C1': -310.13e-27,      # F/Hz
         'C2': 23.168e-36,       # F/Hz^2
-        'C3': -0.15966e-45,     # F/Hz^3
-        'offset_delay': 29.243e-12,  # s (one-way)
+        'C3': -0.16e-45,        # F/Hz^3
+        'offset_delay': 29.493e-12,  # s (one-way)
         'offset_loss': 2.2e9,        # Ω/s (loss term, GΩ/s)
         'offset_z0': 50.0,           # Ω
     },
     'short': {
-        'L0': 2.0765e-12,       # H
+        'L0': 2.076e-12,        # H
         'L1': -108.54e-24,      # H/Hz
-        'L2': 2.1705e-33,       # H/Hz^2
+        'L2': 2.171e-33,        # H/Hz^2
         'L3': -0.01e-42,        # H/Hz^3
         'offset_delay': 31.785e-12,  # s (one-way)
         'offset_loss': 2.36e9,       # Ω/s
@@ -58,9 +58,43 @@ C_LIGHT = 299792458.0  # m/s
 class Keysight85033E:
     """Compute the known reflection coefficients of 85033E standards."""
 
-    def __init__(self, coeffs: dict | None = None, z0: float = 50.0):
+    def __init__(self, coeffs: dict | None = None, z0: float = 50.0,
+                 offset_model: str = 'lossy'):
         self.coeffs = coeffs or KEYSIGHT_85033E
         self.z0 = z0
+        if offset_model not in ('lossy', 'delay'):
+            raise ValueError("offset_model must be 'lossy' or 'delay'")
+        self.offset_model = offset_model
+
+    def _gamma_from_offset_impedance(self, freq_hz: np.ndarray,
+                                     coeff: dict,
+                                     termination_z: np.ndarray) -> np.ndarray:
+        """Transform a termination through the calibration-standard offset line.
+
+        The default lossy model mirrors the legacy calibration.vna_cal
+        implementation. The delay-only mode keeps the simpler round-trip phase
+        model for comparisons.
+        """
+        f = freq_hz.astype(np.float64)
+        if self.offset_model == 'delay':
+            gamma_term = (termination_z - self.z0) / (termination_z + self.z0)
+            return gamma_term * np.exp(-1j * 4.0 * np.pi * f * coeff['offset_delay'])
+
+        loss = coeff.get('offset_loss', 0.0)
+        delay = coeff['offset_delay']
+        line_z0 = coeff.get('offset_z0', self.z0) + (
+            (1.0 - 1.0j) * (loss / (4.0 * np.pi * f)) * np.sqrt(f / 1e9)
+        )
+        alpha_l = (delay * loss / 100.0) * np.sqrt(f / 1e9)
+        beta_l = 2.0 * np.pi * f * delay + alpha_l
+        gamma_l = alpha_l + 1.0j * beta_l
+        tanh_gl = np.tanh(gamma_l)
+
+        zin = line_z0 * (
+            (termination_z + line_z0 * tanh_gl)
+            / (line_z0 + termination_z * tanh_gl)
+        )
+        return (zin - self.z0) / (zin + self.z0)
 
     def gamma_open(self, freq_hz: np.ndarray) -> np.ndarray:
         """Known Γ of the Open standard vs frequency."""
@@ -71,15 +105,8 @@ class Keysight85033E:
         # Fringing capacitance model
         C = c['C0'] + c['C1'] * f + c['C2'] * f**2 + c['C3'] * f**3
 
-        # Reflection from capacitive termination
-        jωCZ0 = 1j * omega * C * self.z0
-        gamma_cap = (1.0 - jωCZ0) / (1.0 + jωCZ0)
-
-        # Offset delay (round-trip phase)
-        delay = c['offset_delay']
-        gamma = gamma_cap * np.exp(-1j * 2.0 * omega * delay)
-
-        return gamma
+        z_open = 1.0 / (1j * omega * C)
+        return self._gamma_from_offset_impedance(f, c, z_open)
 
     def gamma_short(self, freq_hz: np.ndarray) -> np.ndarray:
         """Known Γ of the Short standard vs frequency."""
@@ -90,15 +117,8 @@ class Keysight85033E:
         # Inductance model
         L = c['L0'] + c['L1'] * f + c['L2'] * f**2 + c['L3'] * f**3
 
-        # Reflection from inductive termination
-        jωL = 1j * omega * L
-        gamma_ind = (jωL - self.z0) / (jωL + self.z0)
-
-        # Offset delay (round-trip phase)
-        delay = c['offset_delay']
-        gamma = gamma_ind * np.exp(-1j * 2.0 * omega * delay)
-
-        return gamma
+        z_short = 1j * omega * L
+        return self._gamma_from_offset_impedance(f, c, z_short)
 
     def gamma_load(self, freq_hz: np.ndarray) -> np.ndarray:
         """Known Γ of the Load standard (ideal 50Ω match)."""

@@ -1,0 +1,273 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import scipy.linalg
+import random
+import sys
+from numpy.polynomial import legendre
+import os
+try:
+    from .tools import *
+except ImportError:
+    from tools import *
+
+class Source(object):
+
+    def __init__(self, freq, t_data, spec_data, Gsrc_data, Grec_data, Tsrc, Tamb, name):
+        self.freq = freq       
+        self.Gsrc = Gsrc_data
+        self.Grec = Grec_data
+        self.Ts = np.tile(Tsrc,(len(self.freq),1)).T
+        self.Tamb = np.tile(Tamb,(len(self.freq),1)).T
+        self.P = spec_data
+        self.P_raw = spec_data
+        self.Gsrc_raw = Gsrc_data
+        self.Grec_raw = Grec_data
+        self.t = t_data
+        self.name = name
+
+    def average(self):
+        
+        self.Gsrc = np.mean(self.Gsrc, axis=0)
+        self.Grec = np.mean(self.Grec, axis=0)
+        self.P = np.mean(self.P, axis=0)
+        self.Ts = np.mean(self.Ts, axis=0)
+        self.Tamb = np.mean(self.Tamb, axis=0)
+        return
+
+    def get_K(self, Gsrc, Grec):
+
+        self.K = {}
+        F = np.sqrt(1 - np.abs(Grec)**2)/(1-Gsrc*Grec)
+        self.K['ant'] = (1-np.abs(Gsrc)**2) * np.abs(F)**2
+        self.K['unc'] = np.abs(Gsrc)**2 * np.abs(F)**2
+        self.K['cos'] = (Gsrc * F).real
+        self.K['sin'] = (Gsrc * F).imag
+        self.K['offset'] = 1
+        return
+    
+    def get_X(self, Pcal, PNS, PL, Gsrc, Grec):
+        self.X = {}
+        # F = (1-np.abs(Gsrc)**2) / np.abs(1-Gsrc*Grec)**2
+        F = 1 / np.abs(1-Gsrc*Grec)**2
+        self.X['unc'] = -1 * (np.abs(Gsrc)**2) / np.abs(1-Gsrc*Grec)**2 / F
+        self.X['cos'] = -1 * (Gsrc/(1-Gsrc*Grec)).real / np.sqrt(1-np.abs(Grec)**2)  / F
+        self.X['sin'] = -1 * (Gsrc/(1-Gsrc*Grec)).imag / np.sqrt(1-np.abs(Grec)**2)  / F
+        self.X['ns'] = ((Pcal - PL) / (PNS - PL)) / F
+        self.X['L'] = 1 / F
+        return
+
+    def generate_P(self, Tunc, Tcos, Tsin, Toffset, g=1, add_noise = False):
+
+        P0 = g * (self.K['ant'] * self.Ts + \
+                self.K['unc'] * Tunc + \
+                self.K['cos'] * Tcos + \
+                self.K['sin'] * Tsin + \
+                self.K['offset'] * Toffset )
+        fr_band = 250/8192
+        obs_time = 60*60*100*100
+        std = 1/np.sqrt(obs_time * fr_band *1e6)
+        if add_noise:
+            P = np.random.normal(P0, std*P0, size=P0.shape)
+            # P = P
+        else:
+            P = P0
+        return P
+
+class N2_nw(object):
+    def __init__(
+            self, freq, spec_by_src, vna_by_src, temp_time, temp_data,
+            ambient_temp_index=(0, 0), hotload_temp_index=(2, 0),
+        ):
+        self.freq = freq
+        self.spec_by_src = spec_by_src
+        self.vna_by_src = vna_by_src
+        self.temp_time = temp_time
+        self.temp_data = temp_data
+        self.ambient_temp_index = tuple(ambient_temp_index)
+        self.hotload_temp_index = tuple(hotload_temp_index)
+
+    def _temp_series(self, temp_index):
+        if len(temp_index) != 2:
+            raise ValueError("temp_index must be a (chip, channel) tuple")
+        chip, channel = temp_index
+        try:
+            return self.temp_data[:, chip, channel]
+        except IndexError as exc:
+            raise IndexError(
+                f"temperature index {temp_index} is outside temp_data shape "
+                f"{self.temp_data.shape}"
+            ) from exc
+
+    def load_data(self):
+
+        self.src = {}
+        self.src_list = []
+        ambient_temp = self._temp_series(self.ambient_temp_index)
+        hotload_temp = self._temp_series(self.hotload_temp_index)
+        for ss_k in self.spec_by_src.keys():
+            t_data = self.spec_by_src[ss_k]['time']
+            spec_data = self.spec_by_src[ss_k]['data']
+            Gsrc_data = self.vna_by_src[f'V_{ss_k}']['cal_data_interpolate']
+            Grec_data = self.vna_by_src['V_LNAM_H']['cal_data_interpolate']
+            Tamb = self.interpolate_1d(self.temp_time, ambient_temp, self.spec_by_src[ss_k]['time'])
+            Tsrc = Tamb
+            if 'HL' in ss_k:
+                Tsrc = self.interpolate_1d(self.temp_time, hotload_temp, self.spec_by_src[ss_k]['time'])
+            self.src[ss_k[:-2]] = Source(self.freq, t_data, spec_data, Gsrc_data, Grec_data, Tsrc, Tamb, ss_k)
+            # self.src[ss_k].average()
+            self.src_list.append(ss_k[:-2])
+        self.src_list = list(set(self.src_list))
+
+
+        # for ss_k in self.src.keys():
+        #     if ss_k not in ['NSon', 'NSoff']:
+        #         self.src[ss_k].get_K(self.src[ss_k].Gsrc, self.src[ss_k].Grec)
+        #         self.src[ss_k].get_X(self.src[ss_k].P, self.src['NSon'].P, self.src['NSoff'].P, self.src[ss_k].Gsrc, self.src[ss_k].Grec)
+        return
+
+    def interpolate_1d(self, x, y, fill_x, kind = 'slinear'):
+        inter_func = interpolate.interp1d(x,y,kind = kind, fill_value = 'extrapolate')
+        fill_y = np.array(inter_func(fill_x))
+        return fill_y
+
+    def nwp_fit(self, cal_src_list, fit_term = 7):
+        ss_len = int(len(cal_src_list))
+        self.nwp_fit_term = fit_term
+        self.f_norm = freq_normalized(self.freq)
+        self.f_len = int(len(self.f_norm))
+        f_len = self.f_len
+        A = np.zeros((5 * fit_term, ss_len * f_len))
+        b = np.zeros(ss_len * f_len)
+
+        for i,ss_k in enumerate(cal_src_list):
+            X = ss_k.X
+            b[(i + 0)* self.f_len : (i  + 1) * self.f_len] = ss_k.Ts * (1-np.abs(ss_k.Gsrc)**2)
+            # b[(i + 0)* self.f_len : (i  + 1) * self.f_len] = ss_k.Ts
+
+            for j in range(fit_term):
+                leg_coef = np.zeros(fit_term)
+                leg_coef[j] = 1
+                A[j + 0 * fit_term, (i + 0) * f_len : (i + 1) * f_len] = (X['ns'] * legendre.legval(self.f_norm,leg_coef))
+                A[j + 1 * fit_term, (i + 0) * f_len : (i + 1) * f_len] = (X['unc'] * legendre.legval(self.f_norm,leg_coef))
+                A[j + 2 * fit_term, (i + 0) * f_len : (i + 1) * f_len] = (X['cos'] * legendre.legval(self.f_norm,leg_coef))
+                A[j + 3 * fit_term, (i + 0) * f_len : (i + 1) * f_len] = (X['sin'] * legendre.legval(self.f_norm,leg_coef))
+                A[j + 4 * fit_term, (i + 0) * f_len : (i + 1) * f_len] = (X['L'] * legendre.legval(self.f_norm,leg_coef))
+
+            
+        M = A.T
+        ydata = np.reshape(b, (-1, 1))
+
+        # Solving system using 'short' QR decomposition
+        # (see R. Butt, Num. Anal. Using MATLAB)
+        Q1, R1 = scipy.linalg.qr(M, mode="economic")
+        param = scipy.linalg.solve(R1, np.dot(Q1.T, ydata)).flatten()
+
+        f_X1 = param[0 * fit_term : 1 * fit_term]
+        f_X2 = param[1 * fit_term : 2 * fit_term]
+        f_X3 = param[2 * fit_term : 3 * fit_term]
+        f_X4 = param[3 * fit_term : 4 * fit_term]
+        f_X5 = param[4 * fit_term : 5 * fit_term]
+
+        self.f_TNon = f_X1
+        self.f_Tunc = f_X2
+        self.f_Tcos = f_X3
+        self.f_Tsin = f_X4
+        self.f_TL = f_X5
+        
+        self.TNon_poly = legendre.legval(self.f_norm,self.f_TNon)
+        self.Tunc_poly = legendre.legval(self.f_norm,self.f_Tunc)
+        self.Tcos_poly = legendre.legval(self.f_norm,self.f_Tcos)
+        self.Tsin_poly = legendre.legval(self.f_norm,self.f_Tsin)
+        self.TL_poly = legendre.legval(self.f_norm,self.f_TL)
+
+        return self.TNon_poly, self.Tunc_poly, self.Tcos_poly, self.Tsin_poly, self.TL_poly
+
+
+    def nwp_fbf(self, cal_src_list):
+        ss_len = int(len(cal_src_list))
+        self.f_norm = freq_normalized(self.freq)
+        self.f_len = int(len(self.f_norm))
+        f_len = self.f_len
+        A = np.zeros((f_len, 5, ss_len))
+        b = np.zeros((f_len, ss_len))
+
+        for i,ss_k in enumerate(cal_src_list):
+            X = ss_k.X
+            A[:,0,i] = X['ns']
+            A[:,1,i] = X['unc']
+            A[:,2,i] = X['cos']
+            A[:,3,i] = X['sin']
+            A[:,4,i] = X['L']
+
+            b[:,i] = ss_k.Ts * (1-np.abs(ss_k.Gsrc)**2)
+
+        theta = []
+        for i in range(self.freq.shape[0]):
+            x, residuals, rank, s = np.linalg.lstsq(A.transpose((0, 2, 1))[i], b[i], rcond=None)
+            theta.append(x)
+
+        theta = np.array(theta)
+
+        self.TNon_fbf = theta[:,0]
+        self.Tunc_fbf = theta[:,1]
+        self.Tcos_fbf = theta[:,2]
+        self.Tsin_fbf = theta[:,3]
+        self.TL_fbf = theta[:,4]
+
+        return self.TNon_fbf, self.Tunc_fbf, self.Tcos_fbf, self.Tsin_fbf, self.TL_fbf
+
+
+    def Tsrc_recover(self, Gsrc, X, TNon, Tunc, Tcos, Tsin, TL):
+        return  (X['ns'] * TNon + X['unc'] * Tunc + X['cos'] * Tcos + X['sin'] * Tsin + X['L'] * TL)/(1-np.abs(Gsrc)**2)
+        # return  (X['ns'] * TNon + X['unc'] * Tunc + X['cos'] * Tcos + X['sin'] * Tsin + X['L'] * TL)
+
+
+    def plot_nwp_value(self, freq = None, nwp = None):
+        if freq == None:
+            freq = self.freq
+        if nwp == None:
+            TNon, Tunc, Tcos, Tsin, TL= self.TNon, self.Tunc, self.Tcos, self.Tsin, self.TL
+            T_hot = np.mean(self.src['HL'].Ts) * np.ones(freq.shape[0])
+            T_amb = np.mean(self.src['Cal_L'].Ts) * np.ones(freq.shape[0])
+        else:
+            TNon, Tunc, Tcos, Tsin, TL = nwp
+        fig = plt.figure(figsize=[14,7])
+        ax  = fig.add_subplot(2,2,1)
+        ax.plot(freq,TNon,label='Noise on temperature')
+        # ax.set_xlabel('Freq (MHz)')
+        ax.set_ylabel('Noise Souce Temperature')
+        ax.grid()
+        ax.legend(loc=0)
+        ax.set_title('Noise Souce Temperature')
+        ax  = fig.add_subplot(2,2,2)
+        ax.plot(freq,Tunc,label='Tunc temperature')
+        # ax.set_xlabel('Freq (MHz)')
+        ax.set_ylabel('Tunc Temperature')
+        ax.grid()
+        ax.legend(loc=0)
+        ax.set_title('Tunc Temperature')
+
+        ax  = fig.add_subplot(2,2,3)
+        ax.plot(freq,Tcos, label='Tcos')
+        ax.set_xlabel('Freq (MHz)')
+        ax.set_ylabel('Tcos Temperature')
+        ax.grid()
+        ax.legend(loc=0)
+        ax.set_title('Tcos Temperature')
+
+        ax  = fig.add_subplot(2,2,4)
+        ax.plot(freq,Tsin,label='Tsin')
+        ax.set_xlabel('Freq (MHz)')
+        ax.set_ylabel('Tsin Temperature')
+        ax.grid()
+        ax.legend(loc=0)
+        ax.set_title('Tsin Temperature')
+
+        plt.figure()
+        plt.plot(freq,TL,label='TL')
+        plt.grid()
+        plt.xlabel('Freq (MHz)')
+        plt.ylabel('TL Temperature (K)')
+        plt.legend()
+        
+        return

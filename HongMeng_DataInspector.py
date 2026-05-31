@@ -225,6 +225,99 @@ class DataInspector:
         self._cache[cache_key] = result
         return result
 
+    def split_spec_time_by_src(self, include_time: bool = False) -> Dict[str, np.ndarray]:
+        """按源分割频谱 → {src_name: (n_fft_src, 4, 4096)} 或 {src_name: {'data': ..., 'time': ...}}
+
+        Parameters
+        ----------
+        include_time : bool, optional
+            若为 True，返回 {src_name: {'data': ndarray, 'time': ndarray}}
+            若为 False（默认），返回 {src_name: ndarray}
+        """
+        cache_key = 'spec_with_time' if include_time else 'spec'
+        # if cache_key in self._cache:
+        #     return self._cache[cache_key]
+
+        data = self.data['spec']['data']
+        fft_src, fft_time = self._fft_src_time()
+        sids = self._ordered_sids('spec', np.unique(fft_src))
+
+        result = {}
+        for sid in sids:
+            mask = fft_src == int(sid)
+            if mask.any():
+                name = self._src_name(sid)
+                if include_time:
+                    result[name] = {
+                        'data': data[mask],
+                        'time': fft_time[mask]
+                    }
+                else:
+                    result[name] = data[mask]
+
+        self._cache[cache_key] = result
+        return result
+
+    def split_vna_time_by_src(self, n_freq: Optional[int] = None, include_time: bool = False) -> dict:
+        """按源分割 VNA 扫频
+
+        Parameters
+        ----------
+        n_freq : int, optional
+            仅返回指定频点数的扫频。未指定时返回所有（混合长度用 list）。
+        include_time : bool, optional
+            若为 True，返回 {src_name: {'data': ndarray, 'time': ndarray}}
+            若为 False（默认），返回 {src_name: ndarray}
+
+        Returns
+        -------
+        dict : {src_name: ndarray (n_sweep_src, n_freq) 或 list} 或带 time 的字典
+        """
+        cache_key = f'vna_{n_freq}_{"with_time" if include_time else "no_time"}'
+        # if cache_key in self._cache:
+        #     return self._cache[cache_key]
+
+        vna = self.data['vna']
+        s11 = vna['data']
+        sweep_src, sweep_nf = self._vna_sweep_table()
+
+        freq_mask = (sweep_nf == n_freq) if n_freq is not None else np.ones(len(sweep_src), dtype=bool)
+        filtered_src = sweep_src[freq_mask]
+        sids = self._ordered_sids('vna', np.unique(filtered_src))
+
+        result = {}
+        for sid in sids:
+            src_mask = (sweep_src == int(sid)) & freq_mask
+            if not src_mask.any():
+                continue
+            name = self._src_name(sid)
+            indices = np.where(src_mask)[0]
+
+            if s11.dtype == object:
+                sweeps = [s11[i] for i in indices]
+                try:
+                    data_array = np.stack(sweeps)
+                except ValueError:
+                    data_array = sweeps
+            else:
+                data_array = s11[indices]
+
+            if include_time:
+                # 获取对应的时间
+                sweep_starts = np.where(vna['metadata']['group_flag'] == 1)[0]
+                n_sweep = vna['data'].shape[0]
+                sweep_time = vna['time'][sweep_starts[:n_sweep]]
+                result[name] = {
+                    'data': data_array,
+                    'time': sweep_time[indices]
+                }
+            else:
+                result[name] = data_array
+
+        self._cache[cache_key] = result
+        return result
+
+
     # ================================================================
     #  Info
     # ================================================================

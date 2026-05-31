@@ -61,6 +61,31 @@ freq_hz = np.linspace(30e6, 120e6, 901)
 calibrated, diagnostics = calibrate_vna_data(split, freq_hz)
 ```
 
+### Noisewave校准
+```python
+from calibration.workflow import CalibrationWorkflowConfig, run_calibration_workflow
+
+cfg = CalibrationWorkflowConfig(
+    vna_freq_hz=np.linspace(30e6, 200e6, 1701),
+    spec_freq_range_mhz=(50, 180),
+    receiver_cable_snp="./MWS_dianxing_cable_S/33333-1.s2p",
+    cal_sources = (
+        'LgO', 'LgS', 'ShtS', 'ShtR1', 'ShtR2',
+        'R3', 'R4', 'R5', 'Cal_O', 'Cal_S',
+    ),
+    noise_source_terms = (7, 9),
+    noise_wave_fit_term = 7,
+    noise_wave_iterations = 10,
+    use_legacy_vna_cal = False
+)
+
+cal = run_calibration_workflow(result, cfg)
+
+a = cal.model
+temps = cal.recovered_temperatures
+vna_by_src = cal.vna_by_src
+```
+
 ### 命令行转换
 
 ```bash

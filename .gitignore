@@ -20,6 +20,8 @@ NoiseFigure/
 # ── Binary docs (not diffable; use Markdown for versioned docs)
 docs/*.xlsx
 docs/*.docx
+docs/assets/
+docs/calibration_test*.md
 
 # ── Legacy / backup code ──────────────────────────────────────
 BACKUP/
