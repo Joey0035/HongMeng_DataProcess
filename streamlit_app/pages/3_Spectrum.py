@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import streamlit as st
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 import data_manager
 import data_processor as dp
@@ -76,8 +76,9 @@ with col_cmap:
 
 with col_time:
     fft_src, fft_time = dp.get_fft_src_time(spec)
-    t_min_dt = datetime.fromtimestamp(float(fft_time.min()))
-    t_max_dt = datetime.fromtimestamp(float(fft_time.max()))
+    t_min, t_max = dp.time_bounds(fft_time)
+    t_min_dt = dp.timestamp_to_datetime(t_min)
+    t_max_dt = dp.timestamp_to_datetime(t_max)
     time_range = st.slider(
         "Time Range",
         min_value=t_min_dt,
@@ -88,8 +89,7 @@ with col_time:
         key="spec_time_range",
     )
 
-t_start = time_range[0].timestamp()
-t_end = time_range[1].timestamp()
+t_start, t_end = dp.datetime_range_to_timestamps(time_range, t_min, t_min_dt)
 
 # --- Source selection: checkbox grid ---
 st.divider()

@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import streamlit as st
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 import data_manager
 import data_processor as dp
@@ -77,8 +77,9 @@ time_range = None
 with col_time:
     sweep_times = dp.get_vna_sweep_times(vna)
     if len(sweep_times) > 0:
-        t_min_dt = datetime.fromtimestamp(float(sweep_times.min()))
-        t_max_dt = datetime.fromtimestamp(float(sweep_times.max()))
+        t_min, t_max = dp.time_bounds(sweep_times)
+        t_min_dt = dp.timestamp_to_datetime(t_min)
+        t_max_dt = dp.timestamp_to_datetime(t_max)
         time_range = st.slider(
             "Time Range",
             min_value=t_min_dt,
@@ -88,8 +89,7 @@ with col_time:
             step=timedelta(minutes=30),
             key="vna_time_range",
         )
-        t_start = time_range[0].timestamp()
-        t_end = time_range[1].timestamp()
+        t_start, t_end = dp.datetime_range_to_timestamps(time_range, t_min, t_min_dt)
     else:
         t_start, t_end = 0, float('inf')
 

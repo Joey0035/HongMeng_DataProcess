@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 import data_manager
 import data_processor as dp
@@ -58,8 +58,9 @@ thresholds = {'high': th_high, 'low': th_low}
 st.session_state['temp_thresholds'] = thresholds
 
 with _tc_time:
-    t_min_dt = datetime.fromtimestamp(float(time_arr[0]))
-    t_max_dt = datetime.fromtimestamp(float(time_arr[-1]))
+    t_min, t_max = dp.time_bounds(time_arr)
+    t_min_dt = dp.timestamp_to_datetime(t_min)
+    t_max_dt = dp.timestamp_to_datetime(t_max)
     time_range = st.slider(
         "Time Range",
         min_value=t_min_dt,
@@ -69,8 +70,7 @@ with _tc_time:
         step=timedelta(minutes=30),
     )
 
-t_start = time_range[0].timestamp()
-t_end = time_range[1].timestamp()
+t_start, t_end = dp.datetime_range_to_timestamps(time_range, t_min, t_min_dt)
 
 # --- Sensor selection: checkbox grid by chip ---
 st.divider()

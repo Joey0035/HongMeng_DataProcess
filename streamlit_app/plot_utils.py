@@ -11,7 +11,8 @@ Performance notes:
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from datetime import datetime
+
+import data_processor as dp
 
 # Maximum frequency bins sent to browser for heatmap traces.
 # 4096 → 512 reduces heatmap JSON payload ~8× with no perceptible quality loss.
@@ -422,7 +423,7 @@ def create_temp_timeseries(temp_data: np.ndarray, time_arr: np.ndarray,
         idx = np.arange(0, n, step)
         time_arr = time_arr[idx]
         temp_data = temp_data[idx]
-    dt_list = [datetime.fromtimestamp(float(v)) for v in time_arr]
+    dt_list = [dp.timestamp_to_datetime(float(v)) for v in time_arr]
     for i, (chip, ch, label) in enumerate(selected_points):
         fig.add_trace(go.Scattergl(
             x=dt_list, y=temp_data[:, chip, ch], mode='lines', name=label,

@@ -5,7 +5,7 @@ frequency axes, and time conversion. No Streamlit or Plotly imports.
 
 import numpy as np
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from config import (
@@ -201,13 +201,65 @@ def to_dB_s11(arr: np.ndarray) -> np.ndarray:
 #  Time conversion
 # ==============================================================
 
+try:
+    _LOCAL_UNIX_EPOCH = datetime.fromtimestamp(0)
+except (OSError, OverflowError, ValueError):
+    _LOCAL_UNIX_EPOCH = datetime(1970, 1, 1)
+
+
+def time_bounds(time_arr: np.ndarray) -> tuple:
+    """Return finite (min, max) timestamps from an array."""
+    arr = np.asarray(time_arr, dtype=np.float64)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        raise ValueError("No finite timestamps available")
+    return float(arr.min()), float(arr.max())
+
+
+def timestamp_to_datetime(timestamp: float) -> datetime:
+    """Convert seconds to datetime without failing on platform edge cases."""
+    seconds = float(timestamp)
+    if seconds < 0:
+        return _LOCAL_UNIX_EPOCH + timedelta(seconds=seconds)
+    try:
+        return datetime.fromtimestamp(seconds)
+    except (OSError, OverflowError, ValueError):
+        return _LOCAL_UNIX_EPOCH + timedelta(seconds=seconds)
+
+
+def datetime_to_timestamp(dt: datetime,
+                          ref_timestamp: float = None,
+                          ref_datetime: datetime = None) -> float:
+    """Convert slider datetime back to the raw timestamp seconds.
+
+    When a reference pair is supplied, use relative offset math instead of
+    datetime.timestamp(), which can raise OSError on Windows for early dates.
+    """
+    if ref_timestamp is not None and ref_datetime is not None:
+        return float(ref_timestamp) + (dt - ref_datetime).total_seconds()
+    return (dt - _LOCAL_UNIX_EPOCH).total_seconds()
+
+
+def datetime_range_to_timestamps(time_range: tuple,
+                                 ref_timestamp: float,
+                                 ref_datetime: datetime) -> tuple:
+    """Convert a Streamlit datetime range slider value to raw seconds."""
+    return (
+        datetime_to_timestamp(time_range[0], ref_timestamp, ref_datetime),
+        datetime_to_timestamp(time_range[1], ref_timestamp, ref_datetime),
+    )
+
+
 def timestamps_to_datetime(time_arr: np.ndarray) -> list:
     """Convert float64 UTC seconds to datetime objects."""
-    return [datetime.fromtimestamp(float(t)) for t in time_arr]
+    return [timestamp_to_datetime(float(t)) for t in time_arr]
 
 
 def timestamps_to_datetime_strings(time_arr: np.ndarray, fmt: str = '%H:%M:%S') -> list:
-    return pd.to_datetime(time_arr, unit='s').strftime(fmt).tolist()
+    try:
+        return pd.to_datetime(time_arr, unit='s').strftime(fmt).tolist()
+    except (OSError, OverflowError, ValueError, pd.errors.OutOfBoundsDatetime):
+        return [timestamp_to_datetime(float(t)).strftime(fmt) for t in time_arr]
 
 
 # ==============================================================
@@ -279,7 +331,7 @@ def compute_seq_gap_details(seq: np.ndarray, time_arr: np.ndarray, label: str) -
             'from_seq': int(seq[g]),
             'to_seq': int(seq[g + 1]),
             'estimated_lost': abs(int(actual_diff_wrapped[g]) - 1),
-            'timestamp': datetime.fromtimestamp(float(time_arr[g])).strftime('%Y-%m-%d %H:%M:%S'),
+            'timestamp': timestamp_to_datetime(float(time_arr[g])).strftime('%Y-%m-%d %H:%M:%S'),
         })
     return records
 

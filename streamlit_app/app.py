@@ -13,7 +13,6 @@ import time
 import traceback
 import queue as _queue_mod
 from queue import Empty as _QEmpty
-from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
@@ -280,8 +279,8 @@ with st.sidebar:
         if _tr:
             st.divider()
             _sb_label("Time Coverage")
-            _t0 = datetime.fromtimestamp(_tr[0])
-            _t1 = datetime.fromtimestamp(_tr[1])
+            _t0 = dp.timestamp_to_datetime(_tr[0])
+            _t1 = dp.timestamp_to_datetime(_tr[1])
             _dur = int(_tr[1] - _tr[0])
             _h, _m, _s = _dur // 3600, (_dur % 3600) // 60, _dur % 60
             _dur_str = (f'{_h}h {_m}m' if _h else f'{_m}m {_s}s') if _dur >= 60 else f'{_s}s'
@@ -524,8 +523,8 @@ else:
 
     time_range = st.session_state.get('time_range')
     if time_range:
-        t0 = datetime.fromtimestamp(time_range[0])
-        t1 = datetime.fromtimestamp(time_range[1])
+        t0 = dp.timestamp_to_datetime(time_range[0])
+        t1 = dp.timestamp_to_datetime(time_range[1])
         st.caption(
             f"**{parser_info['filename']}** · "
             f"{parser_info['file_size'] / 1024 / 1024:.1f} MB · "
@@ -551,7 +550,7 @@ else:
                 count = tc.get(ptype.upper(), 0)
                 t_arr = result[ptype]['time']
                 if len(t_arr) > 0 and count > 0:
-                    dt = datetime.fromtimestamp(float(t_arr[-1]))
+                    dt = dp.timestamp_to_datetime(float(t_arr[-1]))
                     st.success(f"**{ptype.upper()}** · {count} pkts · last {dt.strftime('%H:%M:%S')}")
                 else:
                     st.warning(f"**{ptype.upper()}**: no valid data")
